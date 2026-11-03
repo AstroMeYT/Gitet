@@ -53,6 +53,7 @@ Flatpaks and AppImages are added to your `PATH` (a command named after the repo)
 ```bash
 gitet install owner/repo          # or a GitHub URL, or just a name to search
 gitet types owner/repo            # what does this repo offer for my system?
+gitet readme owner/repo           # read the repo's README in your terminal
 gitet update                      # update all apps (or: gitet update name)
 gitet list                        # show installed apps
 gitet delete owner/repo           # uninstall
@@ -80,11 +81,20 @@ gitet install owner/repo --dry-run           # show what would happen
 | `delete` (`remove`, `rm`, `uninstall`) | Remove apps. `-y` skips the prompt, `--purge` deletes Flatpak data, `--force` drops it from the list even if removal fails |
 | `list` (`ls`) | Show installed apps, versions and install type |
 | `types` (`info`, `formats`) | List the package types a repo's release offers for your system |
+| `readme` | Show a repo's README as formatted plain text. `--raw` shows the source, `-w N` sets the wrap width, `--no-pager` prints it all |
 | `search` | Search GitHub repositories |
 | `auto on\|off\|status` | Toggle automatic background updates |
 | `export` / `import` | Save or restore your app list |
 | `self-update` | Update gitet itself (`--check`, `--force`) |
 | `self-install` / `self-uninstall` | Install or remove gitet (`--system`, `--purge`) |
+
+### Reading a README
+
+```bash
+gitet readme owner/repo
+```
+
+The Markdown is converted to plain text: headings are underlined, lists use `-`, tables are drawn with `+---+` borders (or turned into `Header: value` lists if they're too wide), quotes get a `|` prefix, links become `text (url)`, and badges become `[label]`. Long READMEs open in your pager (`$PAGER`, or `less`).
 
 ## Automatic updates
 

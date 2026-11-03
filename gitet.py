@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import base64
 import fnmatch
 import hashlib
+import html
 import json
 import os
 import platform
@@ -37,13 +39,15 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
@@ -1388,6 +1392,440 @@ def cmd_self_install(args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# README viewing (Markdown -> plain text, stdlib only)
+# --------------------------------------------------------------------------
+def dw(s: str) -> int:
+    """Display width (wide CJK = 2, combining marks = 0)."""
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def _pad(s: str, w: int, align: str) -> str:
+    extra = max(w - dw(s), 0)
+    if align == "r":
+        return " " * extra + s
+    if align == "c":
+        return " " * (extra // 2) + s + " " * (extra - extra // 2)
+    return s + " " * extra
+
+
+_HR = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
+_ATX = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$")
+_LIST = re.compile(r"^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$")
+_QUOTE = re.compile(r"^\s{0,3}>\s?(.*)$")
+_CODE = re.compile(r"^\s*\x02(\d+)\x02\s*$")
+_TBL_SEP = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$")
+_SETEXT = re.compile(r"^\s{0,3}(=+|-+)\s*$")
+
+
+def _indent(l: str) -> int:
+    return len(l) - len(l.lstrip(" "))
+
+
+def _split_row(line: str) -> list:
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith("\\|"):
+        line = line[:-1]
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", line)]
+
+
+class MdText:
+    """Small Markdown-to-plain-text converter: headings, lists (as '-'), tables, quotes, code, links..."""
+
+    def __init__(self, width: int = 80):
+        self.width = max(width, 30)
+        self.codes: list = []
+        self.spans: list = []
+        self.refs: dict = {}
+
+    # ---- preprocessing -------------------------------------------------
+    def _span(self, s: str) -> str:
+        self.spans.append(s.strip())
+        return f"\x05{len(self.spans) - 1}\x05"
+
+    def _grab_fences(self, text: str) -> str:
+        lines, out, i = text.split("\n"), [], 0
+        while i < len(lines):
+            m = re.match(r"^(\s*)(`{3,}|~{3,})(.*)$", lines[i])
+            if m and not (m.group(2)[0] == "`" and "`" in m.group(3)):
+                indent, fence = m.group(1), m.group(2)
+                close = re.compile(rf"^\s*{re.escape(fence[0])}{{{len(fence)},}}\s*$")
+                j, body = i + 1, []
+                while j < len(lines) and not close.match(lines[j]):
+                    body.append(lines[j][len(indent):] if lines[j].startswith(indent) else lines[j].lstrip())
+                    j += 1
+                self.codes.append((m.group(3).strip(), body))
+                out.append(f"{indent}\x02{len(self.codes) - 1}\x02")
+                i = j + 1
+            else:
+                out.append(lines[i])
+                i += 1
+        return "\n".join(out)
+
+    def _clean_html(self, t: str) -> str:
+        F = re.S | re.I
+        t = re.sub(r"<!--.*?-->", "", t, flags=re.S)
+
+        def pre(m):
+            body = html.unescape(re.sub(r"<[^>]+>", "", m.group(1))).strip("\n")
+            self.codes.append(("", body.split("\n")))
+            return f"\n\n\x02{len(self.codes) - 1}\x02\n\n"
+
+        t = re.sub(r"<pre\b[^>]*>(.*?)</pre\s*>", pre, t, flags=F)
+        t = re.sub(r"<br\s*/?>", "\x03", t, flags=re.I)
+        t = re.sub(r"<hr\s*/?>", "\n\n---\n\n", t, flags=re.I)
+        t = re.sub(r"<h([1-6])\b[^>]*>(.*?)</h\1\s*>",
+                   lambda m: "\n\n" + "#" * int(m.group(1)) + " " + re.sub(r"\s+", " ", m.group(2)).strip() + "\n\n",
+                   t, flags=F)
+        t = re.sub(r"<img\b[^>]*?\balt\s*=\s*(?:\"([^\"]*)\"|'([^']*)')[^>]*>",
+                   lambda m: f"![{m.group(1) or m.group(2) or ''}](x)", t, flags=F)
+        t = re.sub(r"<img\b[^>]*>", "", t, flags=F)
+        t = re.sub(r"<a\b[^>]*?\bhref\s*=\s*(?:\"([^\"]*)\"|'([^']*)')[^>]*>(.*?)</a\s*>",
+                   lambda m: f"[{m.group(3).strip()}]({m.group(1) or m.group(2)})", t, flags=F)
+        t = re.sub(r"<(b|strong)\b[^>]*>(.*?)</\1\s*>", r"**\2**", t, flags=F)
+        t = re.sub(r"<(i|em)\b[^>]*>(.*?)</\1\s*>", r"*\2*", t, flags=F)
+        t = re.sub(r"<code\b[^>]*>(.*?)</code\s*>", lambda m: self._span(re.sub(r"<[^>]+>", "", m.group(1))), t, flags=F)
+        t = re.sub(r"<li\b[^>]*>", "\n- ", t, flags=re.I)
+        blockish = r"p|div|details|summary|center|section|article|header|footer|table|thead|tbody|tr|ul|ol|blockquote|figure|figcaption"
+        t = re.sub(rf"</(?:{blockish}|li)\s*>", "\n\n", t, flags=re.I)
+        t = re.sub(rf"<(?:{blockish})\b[^>]*>", "\n\n", t, flags=re.I)
+        t = re.sub(r"</t[dh]\s*>", "  ", t, flags=re.I)
+        return re.sub(r"</?[A-Za-z][\w:-]*(?:\s[^<>]*)?/?>", "", t)
+
+    def _extract_refs(self, text: str) -> str:
+        keep = []
+        for l in text.split("\n"):
+            m = re.match(r"^\s{0,3}\[([^\]^][^\]]*)\]:\s*<?(\S+?)>?(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*$", l)
+            if m:
+                self.refs[m.group(1).strip().lower()] = m.group(2)
+            else:
+                keep.append(l)
+        return "\n".join(keep)
+
+    # ---- inline --------------------------------------------------------
+    def inline(self, t: str) -> str:
+        esc: list = []
+
+        def e(m):
+            esc.append(m.group(1))
+            return f"\x04{len(esc) - 1}\x04"
+
+        t = re.sub(r"\\([\\`*_{}\[\]()#+\-.!|>~<])", e, t)
+        t = re.sub(r"\[(!\[[^\]]*\]\([^)]*\))\]\([^)]*\)", r"\1", t)  # badge link -> just the badge
+        t = re.sub(r"!\[([^\]]*)\]\([^)]*\)", lambda m: f"\x06{m.group(1).strip()}\x06" if m.group(1).strip() else "", t)
+        t = re.sub(r"!\[([^\]]*)\]\[[^\]]*\]", lambda m: f"\x06{m.group(1).strip()}\x06" if m.group(1).strip() else "", t)
+
+        def link(m):
+            text, url = m.group(1).strip(), m.group(2).strip()
+            if not url or url.startswith("#") or text == url:
+                return text or url
+            return f"{text} ({url})" if text else url
+
+        t = re.sub(r"\[([^\]]*)\]\(\s*<?([^)\s>]*)>?(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)", link, t)
+
+        def ref(m, text, key):
+            url = self.refs.get(key.strip().lower())
+            if not url:
+                return m.group(0)
+            return text if (url.startswith("#") or text == url) else f"{text} ({url})"
+
+        t = re.sub(r"\[([^\]]+)\]\[([^\]]*)\]", lambda m: ref(m, m.group(1), m.group(2) or m.group(1)), t)
+        t = re.sub(r"\[([^\]^]+)\](?![(\[])", lambda m: ref(m, m.group(1), m.group(1)), t)
+        t = re.sub(r"<(https?://[^>\s]+|mailto:[^>\s]+|[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+)>", r"\1", t)
+        t = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"\1", t)
+        t = re.sub(r"(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)", r"\1", t)
+        t = re.sub(r"(?<![\w*])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![\w*])", r"\1", t)
+        t = re.sub(r"(?<!\w)_(?=\S)(.+?)(?<=\S)_(?!\w)", r"\1", t)
+        t = re.sub(r"~~(?=\S)(.+?)(?<=\S)~~", r"\1", t)
+        t = html.unescape(t).replace("\xa0", " ")
+        t = re.sub(r"[ \t]+", " ", t)
+        t = re.sub(r"\x06([^\x06]*)\x06", r"[\1]", t)
+        t = re.sub(r"\x05(\d+)\x05", lambda m: "`" + self.spans[int(m.group(1))] + "`", t)
+        return re.sub(r"\x04(\d+)\x04", lambda m: esc[int(m.group(1))], t)
+
+    # ---- blocks --------------------------------------------------------
+    def _heading(self, lvl: int, txt: str, width: int) -> list:
+        txt = txt.replace("\x03", " ").strip()
+        if not txt:
+            return []
+        if lvl >= 4:
+            return textwrap.wrap("» " + txt, width, subsequent_indent="  ", break_long_words=False)
+        lines = textwrap.wrap(txt, width, break_long_words=False) or [txt]
+        return lines + [{1: "=", 2: "-", 3: "~"}[lvl] * min(max(dw(l) for l in lines), width)]
+
+    def _table(self, header: list, rows: list, aligns: list, width: int) -> list:
+        ncol = len(header)
+
+        def fix(r):
+            return [self.inline(c).replace("\x03", " ").strip() for c in (r + [""] * ncol)[:ncol]]
+
+        data = [fix(header)] + [fix(r) for r in rows]
+        colw = [max(1, max(dw(r[c]) for r in data)) for c in range(ncol)]
+        avail = width - (3 * ncol + 1)
+        while sum(colw) > avail:
+            k = max(range(ncol), key=lambda c: colw[c])
+            if colw[k] <= 6:
+                break
+            colw[k] -= 1
+        if sum(colw) > avail:  # too many columns for this width: "header: value" lists
+            out = []
+            for r in data[1:]:
+                out += [f"{h}: {v}" for h, v in zip(data[0], r) if v]
+                out.append("")
+            return out[:-1]
+        aligns = (aligns + ["l"] * ncol)[:ncol]
+
+        def border(ch):
+            return "+" + "+".join(ch * (w + 2) for w in colw) + "+"
+
+        def row(cells):
+            wrapped = [textwrap.wrap(c, colw[i], break_long_words=True, break_on_hyphens=False) or [""]
+                       for i, c in enumerate(cells)]
+            return ["| " + " | ".join(_pad(w[k] if k < len(w) else "", colw[i], aligns[i])
+                                       for i, w in enumerate(wrapped)) + " |"
+                    for k in range(max(len(w) for w in wrapped))]
+
+        out = [border("-")] + row(data[0]) + [border("=")]
+        for r in data[1:]:
+            out += row(r)
+        return out + [border("-")]
+
+    def _blocks(self, lines: list, width: int) -> list:
+        out: list = []
+        i, n = 0, len(lines)
+
+        def gap():
+            if out and out[-1] != "":
+                out.append("")
+
+        def table_at(k):
+            if k + 1 >= n or "|" not in lines[k]:
+                return False
+            sep = lines[k + 1]
+            return bool(_TBL_SEP.match(sep)) and "-" in sep and ("|" in sep or len(_split_row(lines[k])) == 1)
+
+        def starts_block(k):
+            l = lines[k]
+            return bool(_ATX.match(l) or _HR.match(l) or _CODE.match(l) or _QUOTE.match(l)
+                        or _LIST.match(l) or table_at(k))
+
+        while i < n:
+            line = lines[i]
+            if not line.strip():
+                i += 1
+                continue
+            m = _CODE.match(line)
+            if m:
+                gap()
+                out += [("    " + b).rstrip() for b in self.codes[int(m.group(1))][1]]
+                gap()
+                i += 1
+                continue
+            m = _ATX.match(line)
+            if m:
+                gap()
+                out += self._heading(len(m.group(1)), self.inline(m.group(2)), width)
+                gap()
+                i += 1
+                continue
+            if _HR.match(line):
+                gap()
+                out.append("─" * min(width, 60))
+                gap()
+                i += 1
+                continue
+            if _QUOTE.match(line):
+                block = []
+                while i < n and _QUOTE.match(lines[i]):
+                    block.append(_QUOTE.match(lines[i]).group(1))
+                    i += 1
+                alert = re.fullmatch(r"\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]", block[0].strip())
+                if alert:
+                    block[0] = alert.group(1) + ":"
+                inner = self._blocks(block, max(width - 2, 20))
+                while inner and inner[-1] == "":
+                    inner.pop()
+                gap()
+                out += [("| " + l).rstrip() for l in inner]
+                gap()
+                continue
+            if table_at(i):
+                hdr = _split_row(line)
+                aligns = ["c" if c.startswith(":") and c.endswith(":") else "r" if c.endswith(":") else "l"
+                          for c in _split_row(lines[i + 1])]
+                i += 2
+                rows = []
+                while i < n and lines[i].strip() and "|" in lines[i] and not (_ATX.match(lines[i]) or _QUOTE.match(lines[i])):
+                    rows.append(_split_row(lines[i]))
+                    i += 1
+                gap()
+                out += self._table(hdr, rows, aligns, width)
+                gap()
+                continue
+            m = _LIST.match(line)
+            if m:
+                base = len(m.group(1))
+                j, blk = i, []
+
+                def kind(l):
+                    mk = _LIST.match(l).group(2)
+                    return "o" if mk[0].isdigit() else mk
+
+                first_kind = kind(line)
+                while j < n:
+                    l = lines[j]
+                    if not l.strip():
+                        k = j + 1
+                        while k < n and not lines[k].strip():
+                            k += 1
+                        if k < n and (_indent(lines[k]) > base or (
+                                _LIST.match(lines[k]) and _indent(lines[k]) == base and not _HR.match(lines[k])
+                                and kind(lines[k]) == first_kind)):
+                            blk.extend(lines[j:k])
+                            j = k
+                            continue
+                        break
+                    ind = _indent(l)
+                    if j == i or ind > base or (ind == base and _LIST.match(l) and not _HR.match(l)
+                                                and kind(l) == first_kind):
+                        blk.append(l)
+                        j += 1
+                    elif ind >= base and not starts_block(j):
+                        blk.append(l)  # lazy continuation of the previous line
+                        j += 1
+                    else:
+                        break
+                items: list = []
+                for l in blk:
+                    lm = _LIST.match(l)
+                    if lm and len(lm.group(1)) <= base + 1 and not _HR.match(l):
+                        items.append([lm.group(2), [lm.group(3)], len(lm.group(1)) + len(lm.group(2)) + 1])
+                    elif items:
+                        items[-1][1].append(l)
+                num = None
+                for marker, body, ci in items:
+                    body2 = [body[0]] + [b[min(_indent(b), ci):] if b.strip() else "" for b in body[1:]]
+                    if marker[0].isdigit():
+                        num = int(re.match(r"\d+", marker).group()) if num is None else num + 1
+                        prefix = f"{num}{marker[-1]} "
+                    else:
+                        prefix = "- "
+                    inner = self._blocks(body2, max(width - len(prefix), 20))
+                    while inner and inner[-1] == "":
+                        inner.pop()
+                    if all(b.strip() for b in body2) and not any(_CODE.match(b) for b in body2):
+                        inner = [l for l in inner if l != ""]  # tight item
+                    inner = inner or [""]
+                    out.append((prefix + inner[0]).rstrip())
+                    out += [(" " * len(prefix) + l).rstrip() if l else "" for l in inner[1:]]
+                i = j
+                gap()
+                continue
+            # paragraph (or setext heading)
+            para, head = [], None
+            while i < n and lines[i].strip():
+                if para:
+                    sm = _SETEXT.match(lines[i])
+                    if sm:
+                        head = 1 if sm.group(1)[0] == "=" else 2
+                        i += 1
+                        break
+                    if starts_block(i):
+                        break
+                para.append(lines[i])
+                i += 1
+            if head:
+                gap()
+                out += self._heading(head, self.inline(" ".join(p.strip() for p in para)), width)
+                gap()
+                continue
+            pieces, buf = [], []
+            for l in para:
+                buf.append(l.strip())
+                if l.endswith("  ") or l.endswith("\\"):  # hard line break
+                    t = " ".join(buf)
+                    pieces.append(t[:-1] if t.endswith("\\") else t)
+                    buf = []
+            if buf:
+                pieces.append(" ".join(buf))
+            text_lines = []
+            for pc in pieces:
+                for sub in pc.split("\x03"):
+                    txt = self.inline(sub).strip()
+                    if txt:
+                        text_lines += textwrap.wrap(txt, width, break_long_words=False, break_on_hyphens=False)
+            if text_lines:
+                gap()
+                out += text_lines
+                gap()
+        return out
+
+    def convert(self, md: str) -> str:
+        md = md.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
+        text = self._grab_fences(md)
+        text = re.sub(r"(?<!`)(`+)([^`\n].*?)\1(?!`)", lambda m: self._span(m.group(2)), text)
+        text = self._extract_refs(self._clean_html(text))
+        res = []
+        for l in self._blocks(text.split("\n"), self.width):
+            l = l.replace("\x03", " ").rstrip()
+            if l == "" and (not res or res[-1] == ""):
+                continue
+            res.append(l)
+        while res and res[-1] == "":
+            res.pop()
+        return "\n".join(res)
+
+
+def page(text: str, no_pager: bool = False) -> None:
+    if sys.stdout.isatty() and not no_pager and text.count("\n") >= shutil.get_terminal_size((80, 24)).lines - 1:
+        cmd = shlex.split(os.environ.get("PAGER") or "less -FRX")
+        if cmd and shutil.which(cmd[0]):
+            try:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
+            except OSError:
+                proc = None
+            if proc:
+                try:
+                    proc.communicate(text)
+                except BrokenPipeError:
+                    pass
+                return
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        pass
+
+
+def cmd_readme(args) -> int:
+    meta = resolve_repo(args.repo)
+    full = meta["full_name"]
+    try:
+        data = api(f"/repos/{full}/readme")
+    except ApiError as e:
+        if e.code == 404:
+            raise GitetError(f"{full} doesn't have a README")
+        raise
+    try:
+        raw = base64.b64decode(data.get("content", "")).decode("utf-8", errors="replace")
+    except ValueError:
+        raise GitetError("couldn't decode the README")
+    name = data.get("name") or "README"
+    is_md = name.lower().endswith((".md", ".markdown", ".mdown", ".mkd", ".mdx"))
+    if args.raw:
+        body = raw
+    elif is_md:
+        body = MdText(args.width or min(shutil.get_terminal_size((80, 24)).columns, 100)).convert(raw)
+    else:
+        say(f"{name} isn't Markdown - showing it as-is")
+        body = raw
+    head = f"{full} - {name}"
+    page(f"{head}\n{'=' * len(head)}\n\n{body.rstrip()}\n", args.no_pager)
+    return 0
+
+
 def cmd_self_update(args) -> int:
     url = os.environ.get("GITET_URL") or SELF_URL
     say(f"checking {url}")
@@ -1456,7 +1894,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="gitet", description="Install apps straight from GitHub releases "
         "(Flatpak > DEB/RPM > AppImage).",
         epilog="examples:\n  gitet install dpaulat/SupercellWX\n  gitet install owner/repo --dry-run\n"
-               "  gitet types owner/repo               # what fits my system?\n  gitet install owner/repo --type appimage\n  gitet delete owner/repo\n  gitet update\n  gitet self-update          # update gitet itself\n  gitet auto on --every 12\n  gitet export apps.json   # then on another PC:\n"
+               "  gitet types owner/repo               # what fits my system?\n  gitet readme owner/repo              # read its README\n  gitet install owner/repo --type appimage\n  gitet delete owner/repo\n  gitet update\n  gitet self-update          # update gitet itself\n  gitet auto on --every 12\n  gitet export apps.json   # then on another PC:\n"
                "  gitet import apps.json",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"gitet {VERSION}")
@@ -1499,6 +1937,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--pre", action="store_true", help="include pre-releases")
     s.add_argument("--all", action="store_true", help="also list files that don't fit this system")
     s.set_defaults(fn=cmd_types)
+
+    s = sub.add_parser("readme", help="show a repo's README as formatted plain text")
+    s.add_argument("repo", metavar="owner/repo")
+    s.add_argument("--raw", action="store_true", help="show the original Markdown source")
+    s.add_argument("-w", "--width", type=int, help="wrap width (default: terminal width, max 100)")
+    s.add_argument("--no-pager", action="store_true", help="print everything instead of using a pager")
+    s.set_defaults(fn=cmd_readme)
 
     s = sub.add_parser("search", help="search GitHub repositories")
     s.add_argument("query", nargs="+")
