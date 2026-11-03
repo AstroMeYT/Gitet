@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
@@ -61,6 +61,7 @@ UNIT_DIR = XDG_CONFIG / "systemd/user"
 USER_BIN = BIN_DIR / "gitet"
 SYSTEM_BIN = Path("/usr/local/bin/gitet")
 CRON_TAG = "# gitet-auto"
+SELF_URL = "https://raw.githubusercontent.com/AstroMeYT/Gitet/main/gitet.py"
 
 NONINTERACTIVE = False  # True for background runs: never prompt for a password
 
@@ -1387,6 +1388,51 @@ def cmd_self_install(args) -> int:
     return 0
 
 
+def cmd_self_update(args) -> int:
+    url = os.environ.get("GITET_URL") or SELF_URL
+    say(f"checking {url}")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"gitet/{VERSION}", "Cache-Control": "no-cache"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise GitetError(f"couldn't fetch the latest gitet: {getattr(e, 'reason', e)}")
+    text = data.decode("utf-8", errors="replace")
+    m = re.search(r'^VERSION = "([\d.]+)"', text, re.M)
+    if not text.startswith("#!") or "python" not in text.splitlines()[0] or not m:
+        raise GitetError("downloaded file doesn't look like gitet - aborting")
+    try:
+        compile(text, "gitet.py", "exec")
+    except SyntaxError as e:
+        raise GitetError(f"downloaded gitet.py has a syntax error ({e.msg}) - aborting")
+    remote = tuple(int(x) for x in m.group(1).split("."))
+    local = tuple(int(x) for x in VERSION.split("."))
+    if remote <= local and not args.force:
+        ok(f"gitet {VERSION} is up to date" if remote == local else
+           f"gitet {VERSION} is newer than the published {m.group(1)}; nothing to do")
+        return 0
+    if args.check:
+        print(f"gitet {VERSION} -> {m.group(1)}")
+        return 0
+    here = self_path()
+    dest = next((t for t in (USER_BIN, SYSTEM_BIN) if t.exists() and t.resolve() == here), None) or installed_path()
+    tmp = Path(tempfile.mkdtemp(prefix="gitet-up-")) / "gitet"
+    try:
+        tmp.write_bytes(data)
+        os.chmod(tmp, 0o755)
+        if os.access(dest.parent, os.W_OK) and (not dest.exists() or os.access(dest, os.W_OK)):
+            staged = dest.with_suffix(".new")
+            shutil.copyfile(tmp, staged)
+            os.chmod(staged, 0o755)
+            os.replace(staged, dest)
+        elif run(sudo_cmd(["install", "-m", "755", str(tmp), str(dest)])) != 0:
+            raise GitetError(f"couldn't write {dest}")
+    finally:
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+    ok(f"gitet updated {VERSION} -> {m.group(1)} ({dest})")
+    return 0
+
+
 def cmd_self_uninstall(args) -> int:
     with Lock():
         auto_disable()
@@ -1410,7 +1456,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="gitet", description="Install apps straight from GitHub releases "
         "(Flatpak > DEB/RPM > AppImage).",
         epilog="examples:\n  gitet install dpaulat/SupercellWX\n  gitet install owner/repo --dry-run\n"
-               "  gitet types owner/repo               # what fits my system?\n  gitet install owner/repo --type appimage\n  gitet delete owner/repo\n  gitet update\n  gitet auto on --every 12\n  gitet export apps.json   # then on another PC:\n"
+               "  gitet types owner/repo               # what fits my system?\n  gitet install owner/repo --type appimage\n  gitet delete owner/repo\n  gitet update\n  gitet self-update          # update gitet itself\n  gitet auto on --every 12\n  gitet export apps.json   # then on another PC:\n"
                "  gitet import apps.json",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"gitet {VERSION}")
@@ -1475,6 +1521,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("self-install", help="(re)install gitet itself")
     s.add_argument("--system", action="store_true", help="install to /usr/local/bin (uses sudo)")
     s.set_defaults(fn=cmd_self_install)
+
+    s = sub.add_parser("self-update", help="update gitet itself to the latest version")
+    s.add_argument("-c", "--check", action="store_true", help="only check if a newer version exists")
+    s.add_argument("-f", "--force", action="store_true", help="reinstall even if already current")
+    s.set_defaults(fn=cmd_self_update)
 
     s = sub.add_parser("self-uninstall", help="remove gitet (keeps your apps)")
     s.add_argument("--purge", action="store_true", help="also delete gitet's app list and cache")
