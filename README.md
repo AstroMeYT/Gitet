@@ -26,6 +26,12 @@ curl -fsSL https://raw.githubusercontent.com/AstroMeYT/Gitet/main/install.sh | b
 curl -fsSL https://raw.githubusercontent.com/AstroMeYT/Gitet/main/install.sh | bash -s -- --uninstall
 ```
 
+To also get the graphical app (see [Graphical interface](#graphical-interface)):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AstroMeYT/Gitet/main/install.sh | bash -s -- --gui
+```
+
 Or run `gitet.py` directly (`chmod +x gitet.py && ./gitet.py`). On first run it installs itself.
 
 **Requirements:** Linux and Python 3.8+. No third-party Python packages. `flatpak` is optional (needed only for Flatpak installs).
@@ -38,7 +44,8 @@ Gitet looks at the files in a repo's latest release and uses the first type that
 |---|---|---|
 | 1 | **Flatpak** (`.flatpak`, `.flatpakref`) | Near-universal on Linux. Installed per-user. |
 | 2 | **System package** (`.deb`, `.rpm`, `.pkg.tar.zst`) | Only the format your distro uses (detected from `/etc/os-release`). Needs sudo. |
-| 3 | **AppImage** | Last resort. Saved, symlinked into `~/.local/bin`, and given a launcher entry. |
+| 3 | **AppImage** | Saved, symlinked into `~/.local/bin`, and given a launcher entry. |
+| 4 | **Archive** (`.tar.gz`, `.tar.xz`, `.tar.bz2`, `.tar.zst`, `.zip`, or a bare executable) | For projects that only publish tarballs/binaries. Extracted safely to `~/.local/share/gitet/apps/`, and the programs inside are linked into `~/.local/bin`. A bundled `.desktop` file becomes a menu entry. |
 
 Before installing it also:
 
@@ -62,7 +69,7 @@ gitet delete owner/repo           # uninstall
 ### Choosing what gets installed
 
 ```bash
-gitet install owner/repo --type appimage     # flatpak | deb | rpm | pacman | appimage | package
+gitet install owner/repo --type appimage     # flatpak | deb | rpm | pacman | appimage | archive | package
 gitet install owner/repo --asset "*arm64*"   # a specific release file (substring or glob)
 gitet install owner/repo --choose            # pick from a numbered list
 gitet install owner/repo --tag v1.2.0        # specific release (pins it; updates skip it)
@@ -86,6 +93,8 @@ gitet install owner/repo --dry-run           # show what would happen
 | `auto on\|off\|status` | Toggle automatic background updates |
 | `export` / `import` | Save or restore your app list |
 | `self-update` | Update gitet itself (`--check`, `--force`) |
+
+Most commands accept `--json` for scripts (see [JSON output](#json-output)).
 | `self-install` / `self-uninstall` | Install or remove gitet (`--system`, `--purge`) |
 
 ### Reading a README
@@ -95,6 +104,34 @@ gitet readme owner/repo
 ```
 
 The Markdown is converted to plain text: headings are underlined, lists use `-`, tables are drawn with `+---+` borders (or turned into `Header: value` lists if they're too wide), quotes get a `|` prefix, links become `text (url)`, and badges become `[label]`. Long READMEs open in your pager (`$PAGER`, or `less`).
+
+## JSON output
+
+`install`, `remove`, `update`, `list`, `types`, `search`, `readme`, `auto` and `self-update` accept `--json`. The result goes to stdout as JSON (progress and messages stay on stderr), and errors look like `{"error": "..."}`.
+
+```bash
+gitet list --json
+gitet update --check --json      # {"available": [{"repo", "installed", "latest", "method"}], "current": [...], ...}
+gitet types owner/repo --json    # system info, every compatible file, the auto-pick, hidden files and why
+gitet install owner/repo --json  # {"results": [{"repo", "ok", "tag", "method", "error"}]}
+```
+
+## Graphical interface
+
+`gitet-gui.py` is a Synaptic-style front-end built with Qt (PyQt6 or PySide6). It is one standalone file: run it once and it installs itself as `gitet-gui` and adds **Gitet** to your app menu.
+
+```bash
+python3 gitet-gui.py
+```
+
+- Sidebar views: **Installed**, **Updates** and **Search results**. Typing in the search box filters the list you're in; press Enter to search GitHub (or paste `owner/repo` / a GitHub URL).
+- Select one or more packages, then **Install**, **Update**, **Remove**, **Launch**, or open them on GitHub. Right-click for more (reinstall, choose package type).
+- Tabs for each package: **README** (formatted or plain text), **Packages** (every compatible file for your system with the recommended one starred; install a specific type or file, optionally pinned) and **Activity** (live output and progress).
+- **Update all**, background **Auto-updates** toggle, import/export of your app list, and update checks for gitet itself.
+- Password prompts for system packages (`sudo`) appear as a dialog.
+- **Settings → GitHub token** stores a token in `~/.config/gitet/token` to avoid GitHub's rate limit.
+
+The GUI needs the `gitet` command (version 1.3+). If it's missing or too old, the GUI offers to download it. `gitet-gui --uninstall` removes the GUI launcher.
 
 ## Automatic updates
 
@@ -132,6 +169,8 @@ gitet self-update
 | `~/.local/bin/gitet` | The gitet program |
 | `~/.local/share/gitet/state.json` | Installed apps and settings |
 | `~/.local/share/gitet/appimages/` | Downloaded AppImages |
+| `~/.local/share/gitet/apps/` | Extracted archives |
+| `~/.config/gitet/token` | Optional GitHub token (also read from `GITHUB_TOKEN` / `GH_TOKEN`) |
 | `~/.local/share/applications/` | Launcher entries created by gitet |
 | `~/.cache/gitet/` | API cache and temporary downloads |
 

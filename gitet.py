@@ -10,6 +10,7 @@ Package hierarchy (first one that exists for your system wins):
     1. Flatpak bundles   (.flatpak / .flatpakref)
     2. System packages   (.deb / .rpm / .pkg.tar.zst, matching your distro)
     3. AppImages         (added to ~/.local/bin and your app launcher)
+    4. Archives          (.tar.gz/.xz/.bz2/.zst, .zip or a bare executable; programs linked into ~/.local/bin)
 
 Only assets matching your CPU architecture are considered.
 
@@ -26,6 +27,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import base64
+import contextlib
 import fnmatch
 import hashlib
 import html
@@ -36,18 +38,20 @@ import re
 import shlex
 import shutil
 import struct
+import tarfile
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
 import unicodedata
+import zipfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
@@ -67,10 +71,16 @@ SYSTEM_BIN = Path("/usr/local/bin/gitet")
 CRON_TAG = "# gitet-auto"
 SELF_URL = "https://raw.githubusercontent.com/AstroMeYT/Gitet/main/gitet.py"
 
+PROGRESS = os.environ.get("GITET_PROGRESS") == "1"  # GUI mode: print '@progress N' lines
 NONINTERACTIVE = False  # True for background runs: never prompt for a password
 
 LABEL = {"flatpak": "Flatpak", "deb": "DEB", "rpm": "RPM",
-         "pacman": "pacman pkg", "appimage": "AppImage"}
+         "pacman": "pacman pkg", "appimage": "AppImage", "archive": "Archive"}
+
+
+def jprint(obj) -> None:
+    sys.stdout.write(json.dumps(obj, indent=2) + "\n")
+    sys.stdout.flush()
 
 
 # --------------------------------------------------------------------------
@@ -153,6 +163,8 @@ def sudo_cmd(cmd: list) -> list:
         if run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
             raise NeedRoot("needs root (run `gitet update` manually)")
         return ["sudo", "-n"] + cmd
+    if os.environ.get("SUDO_ASKPASS") and not sys.stdin.isatty():  # GUI front-end supplies the password dialog
+        return ["sudo", "-A"] + cmd
     return ["sudo"] + cmd
 
 
@@ -246,6 +258,11 @@ def api(path: str, params: dict | None = None, cache: bool = True):
                "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        try:
+            token = (XDG_CONFIG / "gitet" / "token").read_text().strip() or None
+        except OSError:
+            token = None
     if token:
         headers["Authorization"] = f"Bearer {token}"
     ent = _load_cache().get(url) if cache else None
@@ -334,7 +351,10 @@ ARCH_RE = {a: re.compile(rf"(?<![a-z0-9])(?:{p})(?![a-z0-9])") for a, p in ARCH_
 EXCLUDE = re.compile(
     r"(?<![a-z0-9])(?:win(?:dows|32|64)?|mac(?:os)?|darwin|osx|android|freebsd|openbsd|netbsd|ios)(?![a-z0-9])"
     r"|\.(?:exe|msi|dmg|apk|ipa|sig|asc|sha256|sha256sum|zsync|txt|json|ya?ml)$"
-    r"|debuginfo|debugsource|dbgsym|-debug[._-]|\.src\.rpm$|-devel[._-]|-dev_")
+    r"|debuginfo|debugsource|dbgsym|-debug[._-]|\.src\.rpm$|-devel[._-]|-dev_"
+    r"|(?<![a-z0-9])(?:src|source|sources|docs?|completions?|symbols|sbom|dbg)(?![a-z0-9])")
+
+ARCHIVE_EXT = (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tbz", ".tar.zst", ".tzst", ".zip")
 
 DISTRO_WORDS = ("ubuntu", "debian", "fedora", "opensuse", "suse", "centos", "rhel",
                 "rocky", "alma", "manjaro", "el7", "el8", "el9")
@@ -427,6 +447,10 @@ def classify(name: str):
         return "rpm"
     if n.endswith((".pkg.tar.zst", ".pkg.tar.xz")):
         return "pacman"
+    if n.endswith(ARCHIVE_EXT):
+        return "archive"
+    if "linux" in n and not re.search(r"\.[a-z][a-z0-9]{1,4}$", n):  # bare executable, e.g. tool-linux-amd64
+        return "archive"
     return None
 
 
@@ -445,14 +469,14 @@ def distro_bonus(name: str, osr: dict) -> int:
     return bonus
 
 
-KIND_ORDER = ("flatpak", "deb", "rpm", "pacman", "appimage")
+KIND_ORDER = ("flatpak", "deb", "rpm", "pacman", "appimage", "archive")
 FLATPAK_MARK = "# gitet-managed"
 
 
 def kind_support(kind: str, fam):
     if kind == "flatpak":
         return (True, "") if shutil.which("flatpak") else (False, "flatpak isn't installed")
-    if kind == "appimage" or kind == fam:
+    if kind in ("appimage", "archive") or kind == fam:
         return True, ""
     return False, f"this system uses {fam or 'no known package format'}, not {kind}"
 
@@ -466,6 +490,16 @@ def hidden_reason(name: str, host: str) -> str:
     return f"built for another architecture (this system: {host})"
 
 
+def libc_bonus(name: str, osr: dict) -> int:
+    n = name.lower()
+    alpine = osr.get("ID", "").lower() == "alpine"
+    if "musl" in n:
+        return 20 if alpine else 5  # static musl builds run nearly everywhere
+    if alpine and ("gnu" in n or "glibc" in n):
+        return -20
+    return 0
+
+
 def analyze(assets: list, pattern: str | None = None):
     """Split release assets into usable ({kind: [best first]}) and hidden ([(name, reason)])."""
     host = host_arch()
@@ -473,7 +507,9 @@ def analyze(assets: list, pattern: str | None = None):
     pat = None
     if pattern:
         pat = pattern.lower()
-        if not any(ch in pat for ch in "*?["):
+        if pat in {a["name"].lower() for a in assets}:
+            pat = fnmatch.translate(pat) and re.sub(r"([*?\[])", r"[\1]", pat)  # exact file name
+        elif not any(ch in pat for ch in "*?["):
             pat = f"*{pat}*"
     scored, hidden = {}, []
     for a in assets:
@@ -486,7 +522,8 @@ def analyze(assets: list, pattern: str | None = None):
         if not kind or sc is None:
             hidden.append((name, hidden_reason(name, host)))
             continue
-        bonus = distro_bonus(name, osr) if kind in ("deb", "rpm", "pacman") else 0
+        bonus = (distro_bonus(name, osr) if kind in ("deb", "rpm", "pacman")
+                 else libc_bonus(name, osr) if kind == "archive" else 0)
         scored.setdefault(kind, []).append((sc * 100 + bonus, a))
     usable = {k: [a for _, a in sorted(v, key=lambda t: -t[0])] for k, v in scored.items()}
     return usable, hidden
@@ -501,7 +538,7 @@ def build_plan(assets: list, only: set | None = None, pattern: str | None = None
         lst = usable.get(kind)
         if not lst:
             continue
-        if only is None and kind not in ("flatpak", fam, "appimage"):
+        if only is None and kind not in ("flatpak", fam, "appimage", "archive"):
             continue
         if only is not None and kind not in only:
             continue
@@ -530,6 +567,9 @@ def download(asset: dict, dest: Path) -> None:
                 f.write(chunk)
                 sha.update(chunk)
                 done += len(chunk)
+                if PROGRESS and total and time.time() - last > 0.25:
+                    last = time.time()
+                    print(f"@progress {done * 100 // total}", file=sys.stderr, flush=True)
                 if sys.stderr.isatty() and time.time() - last > 0.1:
                     last = time.time()
                     pct = f"{done * 100 // total:3d}%" if total else "   "
@@ -678,6 +718,8 @@ def install_deb(path: Path, full: str, slug: str, prev) -> dict:
     name = out(["dpkg-deb", "-f", str(path), "Package"]).strip() or slug
     if shutil.which("apt-get"):
         cmd = ["apt-get", "install", "-y", str(path)]  # resolves dependencies
+        if not sys.stdin.isatty():
+            cmd = ["env", "DEBIAN_FRONTEND=noninteractive"] + cmd
     elif shutil.which("dpkg"):
         cmd = ["dpkg", "-i", str(path)]
     else:
@@ -867,8 +909,176 @@ def install_appimage(path: Path, full: str, slug: str, prev) -> dict:
     return {"path": str(target), "link": str(link), "desktop": str(desktop), "icon": meta.get("icon", "")}
 
 
+def _is_exec_file(p: Path) -> bool:
+    try:
+        with open(p, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return False
+    return head == b"\x7fELF" or head[:2] == b"#!"
+
+
+def safe_extract(path: Path, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    root = dest.resolve()
+
+    def inside(p: Path) -> bool:
+        r = p.resolve()
+        return r == root or str(r).startswith(str(root) + os.sep)
+
+    name = path.name.lower()
+    try:
+        if name.endswith((".tar.zst", ".tzst")):
+            if not shutil.which("zstd"):
+                raise InstallError("this archive is .zst compressed - install zstd first")
+            if run(["tar", "--zstd", "-xf", str(path), "-C", str(dest)]) != 0:
+                raise InstallError("couldn't extract the archive")
+        elif zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as zf:
+                for info in zf.infolist():
+                    if not inside(dest / info.filename):
+                        raise InstallError("archive contains an unsafe path")
+                    zf.extract(info, dest)
+                    mode = (info.external_attr >> 16) & 0o777
+                    if mode and not info.is_dir():
+                        os.chmod(dest / info.filename, mode | 0o200)
+        elif tarfile.is_tarfile(path):
+            with tarfile.open(path) as tf:
+                members = []
+                for m in tf.getmembers():
+                    target = dest / m.name
+                    if m.isdev() or not inside(target):
+                        continue
+                    if m.issym() and not inside(target.parent / m.linkname):
+                        continue
+                    if m.islnk() and not inside(dest / m.linkname):
+                        continue
+                    members.append(m)
+                kw = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+                tf.extractall(dest, members=members, **kw)
+        else:
+            raise InstallError("unrecognised archive format")
+    except (tarfile.TarError, zipfile.BadZipFile, OSError) as e:
+        raise InstallError(f"couldn't extract the archive: {e}")
+
+
+def pick_executables(root: Path, slug: str) -> list:
+    def depth(p: Path) -> int:
+        return len(p.relative_to(root).parts)
+
+    files = [p for p in root.rglob("*") if p.is_file() and ".so" not in p.name and _is_exec_file(p)]
+    pref = [p for p in files if (p.parent == root or p.parent.name == "bin") and depth(p) <= 3]
+    chosen = ([p for p in pref if os.access(p, os.X_OK)]
+              or [p for p in files if os.access(p, os.X_OK) and depth(p) <= 3]
+              or [p for p in pref if elf_arch(p) or _is_exec_file(p)])
+    key = slug.replace("-", "").replace("_", "")
+    chosen.sort(key=lambda p: (key not in p.name.lower().replace("-", "").replace("_", ""), depth(p), p.name))
+    return chosen[:12]
+
+
+def command_name(p: Path, slug: str) -> str:
+    if re.search(r"(?i)(linux|x86|amd64|x64|arm64|aarch64|armv7)", p.name):
+        return slug
+    return p.name
+
+
+def place_link(name: str, target: Path, app_dir: Path, prev) -> Path | None:
+    link = BIN_DIR / name
+    if link.is_symlink() or link.exists():
+        ours = link.is_symlink() and (str(os.readlink(link)).startswith(str(app_dir))
+                                      or str(link) in ((prev or {}).get("links") or []))
+        if ours:
+            link.unlink()
+        else:
+            warn(f"{link} already exists and isn't ours; using {name}-gitet instead")
+            link = BIN_DIR / f"{name}-gitet"
+            if link.is_symlink() or link.exists():
+                link.unlink()
+    link.symlink_to(target)
+    return link
+
+
+def install_archive(path: Path, full: str, slug: str, prev) -> dict:
+    ensure_path()
+    host = host_arch()
+    work = path.parent / "x"
+    with open(path, "rb") as f:
+        head = f.read(4)
+    if head == b"\x7fELF":  # a bare executable
+        got = elf_arch(path)
+        if got and not arch_compat(got, host):
+            raise InstallError(f"architecture mismatch: binary is {got}, system is {host}")
+        stage = work / slug
+        stage.mkdir(parents=True)
+        shutil.copyfile(path, stage / slug)
+        os.chmod(stage / slug, 0o755)
+    else:
+        safe_extract(path, work / "x")
+        stage = work / "x"
+        entries = list(stage.iterdir())
+        if len(entries) == 1 and entries[0].is_dir():
+            stage = entries[0]
+    exes = pick_executables(stage, slug)
+    if not exes:
+        raise InstallError("couldn't find an executable program inside the archive")
+    for e in exes:
+        got = elf_arch(e)
+        if got and not arch_compat(got, host):
+            raise InstallError(f"architecture mismatch: {e.name} is {got}, system is {host}")
+        if not os.access(e, os.X_OK):
+            os.chmod(e, 0o755)
+    rels = [e.relative_to(stage) for e in exes]
+
+    app_dir = DATA_DIR / "apps" / slug
+    app_dir.parent.mkdir(parents=True, exist_ok=True)
+    staged, old = app_dir.with_name(slug + ".new"), app_dir.with_name(slug + ".old")
+    shutil.rmtree(staged, ignore_errors=True)
+    shutil.rmtree(old, ignore_errors=True)
+    shutil.move(str(stage), str(staged))
+    if app_dir.exists():
+        os.replace(app_dir, old)
+    os.replace(staged, app_dir)
+    shutil.rmtree(old, ignore_errors=True)
+
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    links = []
+    for rel in rels:
+        exe = app_dir / rel
+        links.append(str(place_link(command_name(exe, slug), exe, app_dir, prev)))
+    for oldlink in (prev or {}).get("links") or []:
+        if oldlink not in links and Path(oldlink).is_symlink():
+            Path(oldlink).unlink()
+    rec = {"path": str(app_dir), "links": links, "link": links[0], "desktop": "", "icon": ""}
+
+    desktops = sorted(app_dir.rglob("*.desktop"))[:1]  # GUI apps usually ship their own launcher entry
+    if desktops:
+        d = parse_desktop(desktops[0])
+        meta = {"Name": d.get("Name") or full.split("/")[1], "icon": ""}
+        for k in ("Comment", "Categories", "MimeType", "StartupWMClass", "Terminal"):
+            if d.get(k):
+                meta[k] = d[k]
+        m = re.search(r"%[fFuU]", d.get("Exec", ""))
+        meta["code"] = m.group(0) if m else ""
+        icon_name = d.get("Icon", "")
+        cands = [Path(icon_name)] if icon_name.startswith("/") else []
+        if icon_name and not cands:
+            cands = sorted(app_dir.rglob(f"{icon_name}.svg")) + sorted(
+                app_dir.rglob(f"{icon_name}.png"), key=lambda q: q.stat().st_size, reverse=True)
+        for c in cands:
+            if c.is_file():
+                (DATA_DIR / "icons").mkdir(parents=True, exist_ok=True)
+                dest = DATA_DIR / "icons" / (slug + sniff_icon_ext(c))
+                shutil.copyfile(c, dest)
+                meta["icon"] = str(dest)
+                break
+        rec["desktop"] = str(write_desktop(slug, Path(links[0]), meta, full))
+        rec["icon"] = meta["icon"]
+        refresh_desktop_db()
+    return rec
+
+
 INSTALLERS = {"flatpak": install_flatpak, "deb": install_deb, "rpm": install_rpm,
-              "pacman": install_pacman, "appimage": install_appimage}
+              "pacman": install_pacman, "appimage": install_appimage, "archive": install_archive}
 
 
 def _ours(p: Path) -> bool:
@@ -909,11 +1119,14 @@ def remove_record(rec: dict, purge: bool = False) -> None:
             raise GitetError("package removal failed")
     elif kind == "appimage" and rec.get("path"):
         shutil.rmtree(Path(rec["path"]).parent, ignore_errors=True)
+    elif kind == "archive" and rec.get("path"):
+        shutil.rmtree(rec["path"], ignore_errors=True)
     # launcher entries / PATH commands that gitet created
-    if rec.get("link"):
-        link = Path(rec["link"])
-        if link.is_symlink() or _ours(link):
-            link.unlink()
+    for l in dict.fromkeys([rec.get("link")] + list(rec.get("links") or [])):
+        if l:
+            link = Path(l)
+            if link.is_symlink() or _ours(link):
+                link.unlink()
     for k in ("desktop", "icon"):
         if rec.get(k):
             Path(rec[k]).unlink(missing_ok=True)
@@ -924,7 +1137,7 @@ def remove_record(rec: dict, purge: bool = False) -> None:
 # install / update logic
 # --------------------------------------------------------------------------
 def workdir(kind: str) -> Path:
-    if kind in ("flatpak", "appimage"):
+    if kind in ("flatpak", "appimage", "archive"):
         base = CACHE_DIR / "dl"
         base.mkdir(parents=True, exist_ok=True)
         return Path(tempfile.mkdtemp(dir=base))
@@ -1000,15 +1213,16 @@ def install_one(state: dict, arg: str, args) -> None:
     tag = rel["tag_name"]
     if prev and prev["tag"] == tag and not args.force and not args.dry_run:
         ok(f"{full} {tag} is already installed (use --force to reinstall)")
-        return
+        return dict(prev, already=True)
     say(f"release {tag}" + (" (pre-release)" if rel.get("prerelease") else "")
         + (f", {rel['published_at'][:10]}" if rel.get("published_at") else ""))
     rec = do_install(full, rel, args._only, args.dry_run, prev,
                      getattr(args, "asset", None), getattr(args, "choose", False))
     if args.dry_run:
-        return
+        return None
     rec["pinned"] = bool(args.tag)
     rec["pre"] = bool(args.pre or rel.get("prerelease"))
+    rec["description"] = meta.get("description") or ""
     if prev and prev["method"] != rec["method"]:
         try:
             remove_record(prev)
@@ -1019,40 +1233,42 @@ def install_one(state: dict, arg: str, args) -> None:
     ok(f"installed {full} {tag} via {LABEL[rec['method']]}")
     if rec.get("link"):
         say(f"run it with `{Path(rec['link']).name}` or from your app launcher")
+    return rec
 
 
-def update_apps(state: dict, keys: list, check: bool = False, force: bool = False, auto: bool = False):
-    updated, pending, failed, current = [], [], [], []
+def update_apps(state: dict, keys: list, check: bool = False, force: bool = False, auto: bool = False) -> dict:
+    r = {k: [] for k in ("updated", "available", "pending", "failed", "current", "pinned")}
     for key in keys:
         rec = state["apps"][key]
         try:
             if rec.get("pinned") and not force:
                 say(f"{key}: pinned to {rec['tag']}, skipping")
+                r["pinned"].append({"repo": key, "tag": rec["tag"]})
                 continue
             rel = get_release(key, pre=rec.get("pre", False))
             tag = rel["tag_name"]
             if tag == rec["tag"] and not force:
-                current.append(key)
+                r["current"].append({"repo": key, "tag": tag})
                 continue
             if check:
-                print(f"{key}  {rec['tag']} -> {tag}")
-                updated.append(key)
+                r["available"].append({"repo": key, "installed": rec["tag"], "latest": tag, "method": rec["method"]})
                 continue
             say(f"{key}: {rec['tag']} -> {tag}")
             new = do_install(key, rel, {rec["method"]}, False, rec)
             new["pinned"] = rec.get("pinned", False)
             new["pre"] = rec.get("pre", False)
+            new["description"] = rec.get("description", "")
             state["apps"][key] = new
             save_state(state)
-            updated.append(f"{key} {tag}")
+            r["updated"].append({"repo": key, "from": rec["tag"], "to": tag})
             ok(f"updated {key} to {tag}")
         except NeedRoot:
-            pending.append(key)
+            r["pending"].append(key)
             warn(f"{key}: update needs root, skipped")
         except GitetError as e:
-            failed.append((key, str(e).splitlines()[0]))
+            r["failed"].append({"repo": key, "error": str(e).splitlines()[0]})
             warn(f"{key}: {e}")
-    return updated, pending, failed, current
+    return r
 
 
 # --------------------------------------------------------------------------
@@ -1186,15 +1402,25 @@ def cmd_install(args) -> int:
         else:
             only = {args.type}
     args._only = only
-    rc = 0
+    if args.json and args.dry_run:
+        raise GitetError("--json can't be combined with --dry-run (use: gitet types owner/repo --json)")
+    rc, results = 0, []
     with Lock():
         state = load_state()
         for arg in args.repos:
             try:
-                install_one(state, arg, args)
+                rec = install_one(state, arg, args)
+                if rec:
+                    results.append({"repo": rec["repo"], "ok": True, "tag": rec["tag"], "method": rec["method"],
+                                    "asset": rec.get("asset"), "already": bool(rec.get("already"))})
+                else:
+                    results.append({"repo": arg, "ok": True, "dry_run": True})
             except GitetError as e:
                 err(f"{arg}: {e}")
+                results.append({"repo": arg, "ok": False, "error": str(e)})
                 rc = 1
+    if args.json:
+        jprint({"results": results})
     return rc
 
 
@@ -1208,19 +1434,32 @@ def cmd_types(args) -> int:
     usable, hidden = analyze(assets)
     plan, _ = build_plan(assets)
     pick = plan[0][1][0]["name"] if plan else None
-    print(f"{full}  {rel['tag_name']}")
-    print(f"system: {host_arch()}, {osr.get('PRETTY_NAME') or osr.get('NAME') or 'Linux'}"
-          f"  (system packages: {fam or 'none known'})")
-    if not usable:
-        print("\nNo Flatpak, package or AppImage in this release matches your system.")
+    pretty = osr.get("PRETTY_NAME") or osr.get("NAME") or "Linux"
+    types = []
     for kind in KIND_ORDER:
         lst = usable.get(kind)
-        if not lst:
-            continue
-        good, why = kind_support(kind, fam)
-        print(f"\n{LABEL[kind]}  --type {kind}" + ("" if good else f"   [can't install here: {why}]"))
-        for a in lst:
-            print(f"   {a['name']}  ({human(a.get('size', 0))})" + ("   <- auto-pick" if a["name"] == pick else ""))
+        if lst:
+            good, why = kind_support(kind, fam)
+            types.append({"kind": kind, "label": LABEL[kind], "usable": good, "reason": why,
+                          "assets": [{"name": a["name"], "size": a.get("size", 0), "auto_pick": a["name"] == pick}
+                                     for a in lst]})
+    data = {"repo": full, "tag": rel["tag_name"], "published_at": rel.get("published_at"),
+            "url": meta.get("html_url"), "description": meta.get("description") or "",
+            "stars": meta.get("stargazers_count", 0),
+            "system": {"arch": host_arch(), "os": pretty, "package_format": fam},
+            "auto_pick": {"kind": plan[0][0], "asset": pick} if plan else None,
+            "types": types, "hidden": [{"name": n, "reason": w} for n, w in hidden]}
+    if args.json:
+        jprint(data)
+        return 0 if types else 1
+    print(f"{full}  {data['tag']}")
+    print(f"system: {host_arch()}, {pretty}  (system packages: {fam or 'none known'})")
+    if not types:
+        print("\nNo Flatpak, package, AppImage or archive in this release matches your system.")
+    for t in types:
+        print(f"\n{t['label']}  --type {t['kind']}" + ("" if t["usable"] else f"   [can't install here: {t['reason']}]"))
+        for a in t["assets"]:
+            print(f"   {a['name']}  ({human(a['size'])})" + ("   <- auto-pick" if a["auto_pick"] else ""))
     if hidden:
         if args.all:
             print("\nNot usable on this system:")
@@ -1228,14 +1467,14 @@ def cmd_types(args) -> int:
                 print(f"   {n}  - {why}")
         else:
             print(f"\n{len(hidden)} other file(s) hidden (wrong architecture/OS or not an app) - use --all to list")
-    if usable:
+    if types:
         print(f"\nInstall a specific kind:  gitet install {full} --type <kind>"
               f"\nor a specific file:       gitet install {full} --asset <name>   (or --choose)")
-    return 0 if usable else 1
+    return 0 if types else 1
 
 
 def cmd_remove(args) -> int:
-    rc = 0
+    rc, results = 0, []
     with Lock():
         state = load_state()
         for name in args.names:
@@ -1248,6 +1487,7 @@ def cmd_remove(args) -> int:
                     ans = input(f"Delete {key} {rec['tag']} ({LABEL[rec['method']]})? [y/N] ")
                     if ans.strip().lower() not in ("y", "yes"):
                         say(f"kept {key}")
+                        results.append({"repo": key, "ok": True, "kept": True})
                         continue
                 try:
                     remove_record(rec, purge=args.purge)
@@ -1258,30 +1498,42 @@ def cmd_remove(args) -> int:
                 del state["apps"][key]
                 save_state(state)
                 ok(f"deleted {key}")
+                results.append({"repo": key, "ok": True})
             except GitetError as e:
                 err(str(e))
+                results.append({"repo": name, "ok": False, "error": str(e)})
                 rc = 1
+    if args.json:
+        jprint({"results": results})
     return rc
 
 
 def cmd_update(args) -> int:
-    with Lock():
+    with (contextlib.nullcontext() if args.check else Lock()):
         state = load_state()
         keys = [find_app(state, n) for n in args.names] or sorted(state["apps"])
         if not keys:
             say("nothing installed yet")
-            return 0
-        updated, _, failed, current = update_apps(state, keys, check=args.check, force=args.force)
-    if args.check:
-        if not updated:
+        r = update_apps(state, keys, check=args.check, force=args.force)
+    if args.json:
+        jprint(r)
+    elif args.check:
+        for a in r["available"]:
+            print(f"{a['repo']}  {a['installed']} -> {a['latest']}")
+        if not r["available"]:
             ok("everything is up to date")
-    else:
-        ok(f"{len(updated)} updated, {len(current)} already current" + (f", {len(failed)} failed" if failed else ""))
-    return 1 if failed else 0
+    elif keys:
+        ok(f"{len(r['updated'])} updated, {len(r['current'])} already current"
+           + (f", {len(r['failed'])} failed" if r["failed"] else ""))
+    return 1 if r["failed"] else 0
 
 
 def cmd_list(args) -> int:
     apps = load_state()["apps"]
+    if args.json:
+        jprint({"gitet": VERSION, "apps": [dict(r, repo=k, label=LABEL[r["method"]])
+                                           for k, r in sorted(apps.items(), key=lambda kv: kv[0].lower())]})
+        return 0
     if not apps:
         print("No apps installed. Try: gitet install owner/repo", file=sys.stderr)
         return 0
@@ -1294,11 +1546,17 @@ def cmd_list(args) -> int:
 
 
 def cmd_search(args) -> int:
-    items = api("/search/repositories", {"q": " ".join(args.query), "per_page": 10}, cache=False).get("items", [])
+    items = api("/search/repositories", {"q": " ".join(args.query), "per_page": 20}, cache=False).get("items", [])
+    if args.json:
+        jprint({"results": [{"repo": it["full_name"], "description": it.get("description") or "",
+                             "stars": it.get("stargazers_count", 0), "language": it.get("language") or "",
+                             "url": it.get("html_url"), "updated": it.get("pushed_at") or it.get("updated_at")}
+                            for it in items]})
+        return 0
     if not items:
         print("no results", file=sys.stderr)
         return 1
-    for it in items:
+    for it in items[:10]:
         print(f"{it['full_name']}  ★{it['stargazers_count']}")
         if it.get("description"):
             print(f"    {it['description'][:100]}")
@@ -1320,11 +1578,16 @@ def cmd_auto(args) -> int:
             cfg["auto"] = False
             save_state(state)
             ok("automatic updates OFF - gitet is fully dormant")
-        else:
+        timer = ""
+        if cfg["auto"] and shutil.which("systemctl"):
+            timer = out(["systemctl", "--user", "is-active", "gitet-update.timer"]).strip() or "not systemd"
+        if args.json:
+            jprint({"auto": cfg["auto"], "every_hours": cfg["every_hours"], "timer": timer})
+        elif args.action == "status":
             print(f"automatic updates: {'on' if cfg['auto'] else 'off'}"
                   + (f" (every {cfg['every_hours']}h)" if cfg["auto"] else ""))
-            if cfg["auto"] and shutil.which("systemctl"):
-                print("timer: " + (out(["systemctl", "--user", "is-active", "gitet-update.timer"]).strip() or "not systemd"))
+            if timer:
+                print("timer: " + timer)
     return 0
 
 
@@ -1339,7 +1602,9 @@ def cmd_auto_update(args) -> int:
             CRON_LOG.write_text("")
         with Lock(wait=False):
             state = load_state()
-            updated, pending, failed, _ = update_apps(state, sorted(state["apps"]), auto=True)
+            r = update_apps(state, sorted(state["apps"]), auto=True)
+            updated = [f"{u['repo']} {u['to']}" for u in r["updated"]]
+            pending = r["pending"]
     except GitetError:
         return 0
     parts = []
@@ -1814,6 +2079,11 @@ def cmd_readme(args) -> int:
         raise GitetError("couldn't decode the README")
     name = data.get("name") or "README"
     is_md = name.lower().endswith((".md", ".markdown", ".mdown", ".mkd", ".mdx"))
+    if args.json:
+        width = args.width or 90
+        jprint({"repo": full, "name": name, "url": data.get("html_url"), "markdown": is_md, "source": raw,
+                "text": MdText(width).convert(raw) if is_md else raw})
+        return 0
     if args.raw:
         body = raw
     elif is_md:
@@ -1845,12 +2115,16 @@ def cmd_self_update(args) -> int:
         raise GitetError(f"downloaded gitet.py has a syntax error ({e.msg}) - aborting")
     remote = tuple(int(x) for x in m.group(1).split("."))
     local = tuple(int(x) for x in VERSION.split("."))
+    latest = m.group(1)
+    if args.json and (args.check or (remote <= local and not args.force)):
+        jprint({"current": VERSION, "latest": latest, "update_available": remote > local})
+        return 0
     if remote <= local and not args.force:
         ok(f"gitet {VERSION} is up to date" if remote == local else
-           f"gitet {VERSION} is newer than the published {m.group(1)}; nothing to do")
+           f"gitet {VERSION} is newer than the published {latest}; nothing to do")
         return 0
     if args.check:
-        print(f"gitet {VERSION} -> {m.group(1)}")
+        print(f"gitet {VERSION} -> {latest}")
         return 0
     here = self_path()
     dest = next((t for t in (USER_BIN, SYSTEM_BIN) if t.exists() and t.resolve() == here), None) or installed_path()
@@ -1868,6 +2142,8 @@ def cmd_self_update(args) -> int:
     finally:
         shutil.rmtree(tmp.parent, ignore_errors=True)
     ok(f"gitet updated {VERSION} -> {m.group(1)} ({dest})")
+    if args.json:
+        jprint({"current": latest, "latest": latest, "update_available": False, "updated": True})
     return 0
 
 
@@ -1905,7 +2181,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-t", "--tag", help="install this release tag (pins the app)")
     s.add_argument("--pre", action="store_true", help="allow pre-releases")
     s.add_argument("--type", "--only", dest="type",
-                   choices=["flatpak", "package", "deb", "rpm", "pacman", "appimage"],
+                   choices=["flatpak", "package", "deb", "rpm", "pacman", "appimage", "archive"],
                    help="install this kind instead of auto-selecting ('package' = your distro's format)")
     s.add_argument("--asset", metavar="NAME", help="install the release file matching this name (substring or glob)")
     s.add_argument("--choose", action="store_true", help="pick from the compatible files interactively")
@@ -1978,6 +2254,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("_auto-update")
     s.set_defaults(fn=cmd_auto_update)
+    for name in ("install", "remove", "update", "list", "types", "search", "readme", "auto", "self-update"):
+        sub.choices[name].add_argument("--json", action="store_true", help="machine-readable JSON on stdout")
     return p
 
 
@@ -1989,6 +2267,7 @@ def main() -> int:
         err("run gitet as your normal user - it calls sudo itself when a step needs root")
         return 1
     argv = sys.argv[1:]
+    args = None
     try:
         if (not argv or argv[0] != "_auto-update") and not os.environ.get("GITET_NO_SELF_INSTALL"):
             ensure_installed()
@@ -2000,6 +2279,8 @@ def main() -> int:
         return args.fn(args) or 0
     except GitetError as e:
         err(str(e))
+        if args is not None and getattr(args, "json", False):
+            jprint({"error": str(e)})
         return 1
     except KeyboardInterrupt:
         print(file=sys.stderr)
