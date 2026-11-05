@@ -4,7 +4,6 @@
 #   curl -fsSL https://raw.githubusercontent.com/AstroMeYT/Gitet/main/install.sh | bash
 #
 # Options (pass after `bash -s --` when piping):
-#   --gui         also install the Qt GUI (gitet-gui) and its menu launcher
 #   --system      install to /usr/local/bin (uses sudo) instead of ~/.local/bin
 #   --uninstall   remove gitet (your installed apps are kept)
 #
@@ -19,13 +18,11 @@ URL="${GITET_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/gitet.py}"
 
 SYSTEM=0
 UNINSTALL=0
-GUI=0
 for arg in "$@"; do
   case "$arg" in
     --system) SYSTEM=1 ;;
-    --gui) GUI=1 ;;
     --uninstall) UNINSTALL=1 ;;
-    -h|--help) sed -n '2,14p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -57,7 +54,6 @@ if [ "$UNINSTALL" -eq 1 ]; then
       ok "removed $f"
     fi
   done
-  if [ -x "${HOME}/.local/bin/gitet-gui" ]; then "${HOME}/.local/bin/gitet-gui" --uninstall || true; fi
   systemctl --user disable --now gitet-update.timer >/dev/null 2>&1 || true
   rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/gitet-update."{service,timer}
   systemctl --user daemon-reload >/dev/null 2>&1 || true
@@ -122,26 +118,6 @@ if [ "$SYSTEM" -eq 0 ]; then
       warn "added ~/.local/bin to your PATH - open a new terminal (or run: export PATH=\"\$HOME/.local/bin:\$PATH\")"
       ;;
   esac
-fi
-
-# ---------------------------------------------------------------- GUI (optional)
-if [ "$GUI" -eq 1 ]; then
-  GUI_SRC="$TMP/gitet-gui.py"
-  GUI_URL="${GITET_GUI_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/gitet-gui.py}"
-  if [ -n "$HERE" ] && [ -f "$HERE/gitet-gui.py" ] && [ -z "${GITET_GUI_URL:-}" ]; then
-    cp "$HERE/gitet-gui.py" "$GUI_SRC"
-  else
-    say "downloading $GUI_URL"
-    if command -v curl >/dev/null 2>&1; then curl -fsSL "$GUI_URL" -o "$GUI_SRC" || die "GUI download failed"
-    else wget -qO "$GUI_SRC" "$GUI_URL" || die "GUI download failed"; fi
-  fi
-  head -n1 "$GUI_SRC" | grep -q '^#!.*python' || die "downloaded GUI file doesn't look right"
-  python3 -m py_compile "$GUI_SRC" 2>/dev/null || die "downloaded gitet-gui.py has a syntax error"
-  chmod +x "$GUI_SRC"
-  "$GUI_SRC" --install
-  python3 -c 'import PyQt6' 2>/dev/null || python3 -c 'import PySide6' 2>/dev/null \
-    || warn "the GUI needs PyQt6: sudo apt install python3-pyqt6  (or: pip install --user PyQt6)"
-  ok "installed gitet-gui - find \"Gitet\" in your app menu"
 fi
 
 echo >&2

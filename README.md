@@ -26,12 +26,6 @@ curl -fsSL https://raw.githubusercontent.com/AstroMeYT/Gitet/main/install.sh | b
 curl -fsSL https://raw.githubusercontent.com/AstroMeYT/Gitet/main/install.sh | bash -s -- --uninstall
 ```
 
-To also get the graphical app (see [Graphical interface](#graphical-interface)):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/AstroMeYT/Gitet/main/install.sh | bash -s -- --gui
-```
-
 Or run `gitet.py` directly (`chmod +x gitet.py && ./gitet.py`). On first run it installs itself.
 
 **Requirements:** Linux and Python 3.8+. No third-party Python packages. `flatpak` is optional (needed only for Flatpak installs).
@@ -115,23 +109,6 @@ gitet update --check --json      # {"available": [{"repo", "installed", "latest"
 gitet types owner/repo --json    # system info, every compatible file, the auto-pick, hidden files and why
 gitet install owner/repo --json  # {"results": [{"repo", "ok", "tag", "method", "error"}]}
 ```
-
-## Graphical interface
-
-`gitet-gui.py` is a Synaptic-style front-end built with Qt (PyQt6 or PySide6). It is one standalone file: run it once and it installs itself as `gitet-gui` and adds **Gitet** to your app menu.
-
-```bash
-python3 gitet-gui.py
-```
-
-- Sidebar views: **Installed**, **Updates** and **Search results**. Typing in the search box filters the list you're in; press Enter to search GitHub (or paste `owner/repo` / a GitHub URL).
-- Select one or more packages, then **Install**, **Update**, **Remove**, **Launch**, or open them on GitHub. Right-click for more (reinstall, choose package type).
-- Tabs for each package: **README** (formatted or plain text), **Packages** (every compatible file for your system with the recommended one starred; install a specific type or file, optionally pinned) and **Activity** (live output and progress).
-- **Update all**, background **Auto-updates** toggle, import/export of your app list, and update checks for gitet itself.
-- Password prompts for system packages (`sudo`) appear as a dialog.
-- **Settings → GitHub token** stores a token in `~/.config/gitet/token` to avoid GitHub's rate limit.
-
-The GUI needs the `gitet` command (version 1.3+). If it's missing or too old, the GUI offers to download it. `gitet-gui --uninstall` removes the GUI launcher.
 
 ## Automatic updates
 

@@ -51,7 +51,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
@@ -71,7 +71,6 @@ SYSTEM_BIN = Path("/usr/local/bin/gitet")
 CRON_TAG = "# gitet-auto"
 SELF_URL = "https://raw.githubusercontent.com/AstroMeYT/Gitet/main/gitet.py"
 
-PROGRESS = os.environ.get("GITET_PROGRESS") == "1"  # GUI mode: print '@progress N' lines
 NONINTERACTIVE = False  # True for background runs: never prompt for a password
 
 LABEL = {"flatpak": "Flatpak", "deb": "DEB", "rpm": "RPM",
@@ -163,8 +162,6 @@ def sudo_cmd(cmd: list) -> list:
         if run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
             raise NeedRoot("needs root (run `gitet update` manually)")
         return ["sudo", "-n"] + cmd
-    if os.environ.get("SUDO_ASKPASS") and not sys.stdin.isatty():  # GUI front-end supplies the password dialog
-        return ["sudo", "-A"] + cmd
     return ["sudo"] + cmd
 
 
@@ -567,9 +564,6 @@ def download(asset: dict, dest: Path) -> None:
                 f.write(chunk)
                 sha.update(chunk)
                 done += len(chunk)
-                if PROGRESS and total and time.time() - last > 0.25:
-                    last = time.time()
-                    print(f"@progress {done * 100 // total}", file=sys.stderr, flush=True)
                 if sys.stderr.isatty() and time.time() - last > 0.1:
                     last = time.time()
                     pct = f"{done * 100 // total:3d}%" if total else "   "
@@ -718,8 +712,6 @@ def install_deb(path: Path, full: str, slug: str, prev) -> dict:
     name = out(["dpkg-deb", "-f", str(path), "Package"]).strip() or slug
     if shutil.which("apt-get"):
         cmd = ["apt-get", "install", "-y", str(path)]  # resolves dependencies
-        if not sys.stdin.isatty():
-            cmd = ["env", "DEBIAN_FRONTEND=noninteractive"] + cmd
     elif shutil.which("dpkg"):
         cmd = ["dpkg", "-i", str(path)]
     else:
@@ -1050,7 +1042,7 @@ def install_archive(path: Path, full: str, slug: str, prev) -> dict:
             Path(oldlink).unlink()
     rec = {"path": str(app_dir), "links": links, "link": links[0], "desktop": "", "icon": ""}
 
-    desktops = sorted(app_dir.rglob("*.desktop"))[:1]  # GUI apps usually ship their own launcher entry
+    desktops = sorted(app_dir.rglob("*.desktop"))[:1]  # desktop apps usually ship their own launcher entry
     if desktops:
         d = parse_desktop(desktops[0])
         meta = {"Name": d.get("Name") or full.split("/")[1], "icon": ""}
