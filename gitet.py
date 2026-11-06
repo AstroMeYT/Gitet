@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-gitet - install and update apps straight from GitHub releases.
+gitet - install and update apps straight from GitHub (or GitLab / Codeberg) releases.
 
-    gitet install dpaulat/SupercellWX
+    gitet install dpaulat/SupercellWX          # GitHub is the default host
+    gitet install gitlab:group/project         # GitLab
+    gitet install codeberg:owner/repo          # Codeberg
     gitet update
     gitet auto on
 
@@ -19,7 +21,8 @@ On first run gitet copies itself to ~/.local/bin/gitet (use
 when automatic updates are off nothing of gitet is running. When they are on,
 a systemd user timer (or a cron entry) launches a short one-shot check.
 
-Environment: GITHUB_TOKEN / GH_TOKEN raises the GitHub API rate limit.
+Environment: GITHUB_TOKEN / GH_TOKEN raises the GitHub API rate limit (GITLAB_TOKEN, CODEBERG_TOKEN and
+             GITEA_TOKEN work for the other hosts).
              GITET_NO_SELF_INSTALL=1 skips the self-install step.
 """
 from __future__ import annotations
@@ -51,7 +54,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
@@ -123,7 +126,9 @@ class ApiError(GitetError):
         self.code = code
 
 
-def human(n: float) -> str:
+def human(n) -> str:
+    if n is None:
+        return "size unknown"
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
@@ -207,13 +212,13 @@ def save_state(s: dict) -> None:
 
 
 def find_app(state: dict, name: str) -> str:
-    parsed = parse_repo(name)
-    n = (f"{parsed[0]}/{parsed[1]}" if parsed else name).lower().strip()
+    t = parse_target(name)
+    n = (t.canonical() if t else name).lower().strip()
     apps = state["apps"]
     exact = [k for k in apps if k.lower() == n]
     if exact:
         return exact[0]
-    short = [k for k in apps if k.split("/")[1].lower() == n]
+    short = [k for k in apps if repo_name(k).lower() == n]
     if len(short) == 1:
         return short[0]
     if len(short) > 1:
@@ -247,90 +252,382 @@ def _save_cache() -> None:
         pass
 
 
-def api(path: str, params: dict | None = None, cache: bool = True):
-    url = "https://api.github.com" + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    headers = {"User-Agent": f"gitet/{VERSION}",
-               "Accept": "application/vnd.github+json",
-               "X-GitHub-Api-Version": "2022-11-28"}
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if not token:
+# --------------------------------------------------------------------------
+# hosting providers: GitHub (default), GitLab, Codeberg / Gitea / Forgejo
+# --------------------------------------------------------------------------
+TOKEN_ENV = {"github": ("GITHUB_TOKEN", "GH_TOKEN"), "gitlab": ("GITLAB_TOKEN",),
+             "codeberg": ("CODEBERG_TOKEN", "FORGEJO_TOKEN", "GITEA_TOKEN"),
+             "gitea": ("GITEA_TOKEN", "FORGEJO_TOKEN")}
+
+
+def token_for(name: str):
+    for var in TOKEN_ENV.get(name, ()):
+        if os.environ.get(var):
+            return os.environ[var]
+    for fname in [f"token-{name}"] + (["token"] if name == "github" else []):
         try:
-            token = (XDG_CONFIG / "gitet" / "token").read_text().strip() or None
+            tok = (XDG_CONFIG / "gitet" / fname).read_text().strip()
+            if tok:
+                return tok
         except OSError:
-            token = None
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+            continue
+    return None
+
+
+def http_json(url: str, headers: dict | None = None, cache: bool = True, label: str = "the server", hint: str = ""):
+    h = {"User-Agent": f"gitet/{VERSION}"}
+    h.update(headers or {})
     ent = _load_cache().get(url) if cache else None
     if ent:
-        headers["If-None-Match"] = ent["etag"]  # 304s don't count against the rate limit
+        h["If-None-Match"] = ent["etag"]  # 304s don't count against rate limits
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
-            data = json.load(r)
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
             etag = r.headers.get("ETag")
     except urllib.error.HTTPError as e:
         if e.code == 304 and ent:
             return ent["data"]
         if e.code == 404:
-            raise ApiError(f"not found on GitHub ({path}); private repos need GITHUB_TOKEN", 404)
-        if e.code in (403, 429) and e.headers.get("X-RateLimit-Remaining") == "0":
-            raise ApiError("GitHub API rate limit reached - set GITHUB_TOKEN or wait a while", 403)
-        raise ApiError(f"GitHub API error {e.code}", e.code)
+            raise ApiError(f"not found on {label}" + (f" (private repos need {hint})" if hint else ""), 404)
+        if e.code == 429 or e.headers.get("X-RateLimit-Remaining") == "0":
+            raise ApiError(f"{label} rate limit reached - " + (f"set {hint} or " if hint else "") + "wait a while", 403)
+        if e.code in (401, 403):
+            raise ApiError(f"{label} refused the request ({e.code})" + (f" - check {hint}" if hint else ""), e.code)
+        raise ApiError(f"{label} API error {e.code}", e.code)
     except urllib.error.URLError as e:
         raise ApiError(f"network error: {e.reason}")
+    except ValueError:
+        raise ApiError(f"{label} returned something that isn't JSON")
     if cache and etag:
         _load_cache()[url] = {"etag": etag, "data": data}
         _save_cache()
     return data
 
 
-def parse_repo(s: str):
+def http_text(url: str, headers: dict | None = None, label: str = "the server") -> str:
+    h = {"User-Agent": f"gitet/{VERSION}"}
+    h.update(headers or {})
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=30) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        raise ApiError(f"{label}: HTTP {e.code}", e.code)
+    except urllib.error.URLError as e:
+        raise ApiError(f"network error: {e.reason}")
+
+
+def api(path: str, params: dict | None = None, cache: bool = True):
+    """GitHub REST API."""
+    url = "https://api.github.com" + path + (("?" + urllib.parse.urlencode(params)) if params else "")
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    token = token_for("github")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return http_json(url, headers, cache, label="GitHub", hint="GITHUB_TOKEN")
+
+
+class Target:
+    """A repository on some host. `canonical()` is the id gitet stores and prints:
+    owner/repo (GitHub), gitlab:group/repo, codeberg:owner/repo, gitea:host/owner/repo."""
+
+    def __init__(self, kind: str, host: str, path: str, prefix: str):
+        self.kind, self.host, self.path, self.prefix = kind, host, path, prefix
+
+    def canonical(self) -> str:
+        if self.kind == "github":
+            return self.path
+        if self.prefix == "gitlab":
+            return "gitlab:" + (self.path if self.host == "gitlab.com" else f"{self.host}/{self.path}")
+        if self.prefix == "codeberg":
+            return "codeberg:" + self.path
+        return f"gitea:{self.host}/{self.path}"
+
+
+URL_HOSTS = {"github.com": ("github", ""), "gitlab.com": ("gitlab", "gitlab"), "codeberg.org": ("gitea", "codeberg")}
+PREFIXES = {"github": ("github", "", "github.com"), "gitlab": ("gitlab", "gitlab", "gitlab.com"),
+            "codeberg": ("gitea", "codeberg", "codeberg.org"), "gitea": ("gitea", "gitea", ""),
+            "forgejo": ("gitea", "gitea", "")}
+
+
+def _strip_git(path: str) -> str:
+    return path[:-4] if path.endswith(".git") else path
+
+
+def parse_target(s: str):
+    """owner/repo, github:/gitlab:/codeberg:/gitea:host/ prefixes, or a repo URL -> Target (or None)."""
     s = s.strip()
-    m = re.match(r"^(?:https?://)?(?:www\.)?github\.com/([\w.-]+)/([\w.-]+)", s)
-    if not m:
-        m = re.fullmatch(r"([\w.-]+)/([\w.-]+)", s)
-    if not m:
-        return None
-    owner, name = m.groups()
-    if name.endswith(".git"):
-        name = name[:-4]
-    return owner, name
+    m = re.match(r"^(github|gitlab|codeberg|gitea|forgejo):(?!//)(.+)$", s, re.I)
+    if m:
+        kind, prefix, host = PREFIXES[m.group(1).lower()]
+        segs = [x for x in m.group(2).strip().strip("/").split("/") if x]
+        if kind == "gitea" and prefix == "gitea":  # self-hosted: gitea:host/owner/repo
+            if len(segs) != 3 or "." not in segs[0]:
+                return None
+            host = segs.pop(0)
+        elif kind == "gitlab" and len(segs) >= 3 and "." in segs[0]:  # gitlab:host/group/repo
+            host = segs.pop(0)
+        need_two = kind != "gitlab"
+        if (need_two and len(segs) != 2) or len(segs) < 2:
+            return None
+        return Target(kind, host, _strip_git("/".join(segs)), prefix)
+    m = re.match(r"^(?:https?://)?(?:www\.)?([\w.-]+)/(.+)$", s)
+    if m and m.group(1).lower() in URL_HOSTS:
+        host = m.group(1).lower()
+        kind, prefix = URL_HOSTS[host]
+        segs = [x for x in m.group(2).split("?")[0].split("#")[0].split("/") if x]
+        if kind == "gitlab":
+            segs = segs[:segs.index("-")] if "-" in segs else segs
+        else:
+            segs = segs[:2]
+        if len(segs) < 2:
+            return None
+        return Target(kind, host, _strip_git("/".join(segs)), prefix)
+    m = re.fullmatch(r"([\w.-]+)/([\w.-]+)", s)
+    if m:
+        return Target("github", "github.com", _strip_git(f"{m.group(1)}/{m.group(2)}"), "")
+    return None
+
+
+def pick_readme(items: list):
+    cands = [i for i in items if re.fullmatch(r"readme(\.\w+)?", i.get("name", ""), re.I)]
+    rank = lambda i: (0 if i["name"].lower().endswith((".md", ".markdown")) else 1 if "." not in i["name"] else 2, i["name"])
+    return sorted(cands, key=rank)[0] if cands else None
+
+
+class Provider:
+    label = ""
+
+    def __init__(self, host: str, prefix: str):
+        self.host, self.prefix = host, prefix
+
+    @property
+    def name(self) -> str:
+        return self.prefix or "github"
+
+    def canonical(self, path: str) -> str:
+        return Target(self.kind, self.host, path, self.prefix).canonical()
+
+
+class GitHub(Provider):
+    kind = "github"
+
+    def repo(self, path: str) -> dict:
+        d = api(f"/repos/{path}")
+        return {"full_name": d["full_name"], "description": d.get("description") or "",
+                "html_url": d.get("html_url"), "stargazers_count": d.get("stargazers_count", 0)}
+
+    def release(self, path: str, tag, pre: bool) -> dict:
+        if tag:
+            return api(f"/repos/{path}/releases/tags/{urllib.parse.quote(tag)}")
+        if not pre:
+            try:
+                return api(f"/repos/{path}/releases/latest")
+            except ApiError as e:
+                if e.code != 404:
+                    raise
+        for r in api(f"/repos/{path}/releases", {"per_page": 15}):
+            if not r.get("draft"):
+                return r
+        raise GitetError(f"{path} has no releases")
+
+    def readme(self, path: str) -> dict:
+        try:
+            d = api(f"/repos/{path}/readme")
+        except ApiError as e:
+            if e.code == 404:
+                raise GitetError(f"{path} doesn't have a README")
+            raise
+        try:
+            text = base64.b64decode(d.get("content", "")).decode("utf-8", errors="replace")
+        except ValueError:
+            raise GitetError("couldn't decode the README")
+        return {"name": d.get("name") or "README", "text": text, "html_url": d.get("html_url")}
+
+    def search(self, q: str, limit: int) -> list:
+        items = api("/search/repositories", {"q": q, "per_page": limit}, cache=False).get("items", [])
+        return [{"repo": it["full_name"], "description": it.get("description") or "", "stars": it.get("stargazers_count", 0),
+                 "language": it.get("language") or "", "url": it.get("html_url"),
+                 "updated": it.get("pushed_at") or it.get("updated_at")} for it in items]
+
+
+class GitLab(Provider):
+    kind = "gitlab"
+    label = "GitLab"
+
+    def _headers(self) -> dict:
+        tok = token_for("gitlab")
+        return {"PRIVATE-TOKEN": tok} if tok else {}
+
+    def _url(self, path: str, params=None) -> str:
+        return f"https://{self.host}/api/v4{path}" + (("?" + urllib.parse.urlencode(params)) if params else "")
+
+    def _get(self, path: str, params=None, cache: bool = True):
+        return http_json(self._url(path, params), self._headers(), cache, label=f"GitLab ({self.host})", hint="GITLAB_TOKEN")
+
+    @staticmethod
+    def pid(path: str) -> str:
+        return urllib.parse.quote(path, safe="")
+
+    def repo(self, path: str) -> dict:
+        d = self._get(f"/projects/{self.pid(path)}")
+        return {"full_name": self.canonical(d["path_with_namespace"]), "description": d.get("description") or "",
+                "html_url": d.get("web_url"), "stargazers_count": d.get("star_count", 0)}
+
+    def release(self, path: str, tag, pre: bool) -> dict:
+        pid = self.pid(path)
+        if tag:
+            r = self._get(f"/projects/{pid}/releases/{urllib.parse.quote(tag, safe='')}")
+        else:
+            rels = self._get(f"/projects/{pid}/releases", {"per_page": 20, "order_by": "released_at", "sort": "desc"})
+            r = next((x for x in rels if pre or not x.get("upcoming_release")), None)
+            if not r:
+                raise GitetError(f"{self.canonical(path)} has no releases")
+        web = f"https://{self.host}/{path}"
+        assets, seen = [], set()
+
+        def add(url: str, label: str):
+            if not url.startswith("http") or url in seen:
+                return
+            base = urllib.parse.unquote(urllib.parse.urlparse(url).path.rsplit("/", 1)[-1])
+            name = base if classify(base) else (label if classify(label) else base)
+            seen.add(url)
+            assets.append({"name": name, "size": None, "browser_download_url": url})
+
+        for l in ((r.get("assets") or {}).get("links") or []):
+            add(l.get("direct_asset_url") or l.get("url") or "", l.get("name") or "")
+        for m in re.finditer(r"\[([^\]]*)\]\(([^)\s]+)\)", r.get("description") or ""):  # files uploaded into the notes
+            add(web + m.group(2) if m.group(2).startswith("/") else m.group(2), m.group(1))
+        return {"tag_name": r["tag_name"], "published_at": r.get("released_at") or r.get("created_at"),
+                "prerelease": bool(r.get("upcoming_release")), "assets": assets}
+
+    def readme(self, path: str) -> dict:
+        pid, full = self.pid(path), self.canonical(path)
+        try:
+            proj = self._get(f"/projects/{pid}")
+            tree = self._get(f"/projects/{pid}/repository/tree", {"per_page": 100})
+        except ApiError as e:
+            if e.code == 404:
+                raise GitetError(f"{full} doesn't have a README")
+            raise
+        f = pick_readme([i for i in tree if i.get("type") == "blob"])
+        if not f:
+            raise GitetError(f"{full} doesn't have a README")
+        branch = proj.get("default_branch") or "HEAD"
+        text = http_text(self._url(f"/projects/{pid}/repository/files/{urllib.parse.quote(f['path'], safe='')}/raw",
+                                   {"ref": branch}), self._headers(), label=f"GitLab ({self.host})")
+        return {"name": f["name"], "text": text, "html_url": f"{proj.get('web_url')}/-/blob/{branch}/{f['path']}"}
+
+    def search(self, q: str, limit: int) -> list:
+        items = self._get("/projects", {"search": q, "order_by": "star_count", "sort": "desc", "per_page": limit,
+                                        "simple": "true"}, cache=False)
+        return [{"repo": self.canonical(it["path_with_namespace"]), "description": it.get("description") or "",
+                 "stars": it.get("star_count", 0), "language": "", "url": it.get("web_url"),
+                 "updated": it.get("last_activity_at")} for it in items]
+
+
+class Gitea(Provider):
+    """Codeberg, Forgejo and Gitea share one API."""
+    kind = "gitea"
+
+    @property
+    def label(self) -> str:
+        return "Codeberg" if self.prefix == "codeberg" else f"Gitea ({self.host})"
+
+    def _headers(self) -> dict:
+        tok = token_for(self.name)
+        return {"Authorization": f"token {tok}"} if tok else {}
+
+    def _url(self, path: str, params=None) -> str:
+        return f"https://{self.host}/api/v1{path}" + (("?" + urllib.parse.urlencode(params)) if params else "")
+
+    def _get(self, path: str, params=None, cache: bool = True):
+        hint = {"codeberg": "CODEBERG_TOKEN"}.get(self.name, "GITEA_TOKEN")
+        return http_json(self._url(path, params), self._headers(), cache, label=self.label, hint=hint)
+
+    def repo(self, path: str) -> dict:
+        d = self._get(f"/repos/{path}")
+        return {"full_name": self.canonical(d["full_name"]), "description": d.get("description") or "",
+                "html_url": d.get("html_url"), "stargazers_count": d.get("stars_count", 0)}
+
+    def release(self, path: str, tag, pre: bool) -> dict:
+        if tag:
+            return self._get(f"/repos/{path}/releases/tags/{urllib.parse.quote(tag)}")
+        if not pre:
+            try:
+                return self._get(f"/repos/{path}/releases/latest")
+            except ApiError as e:
+                if e.code != 404:
+                    raise
+        for r in self._get(f"/repos/{path}/releases", {"limit": 20}):
+            if not r.get("draft"):
+                return r
+        raise GitetError(f"{self.canonical(path)} has no releases")
+
+    def readme(self, path: str) -> dict:
+        full = self.canonical(path)
+        try:
+            items = self._get(f"/repos/{path}/contents")
+        except ApiError as e:
+            if e.code == 404:
+                raise GitetError(f"{full} doesn't have a README")
+            raise
+        f = pick_readme([i for i in items if isinstance(i, dict) and i.get("type") == "file"]) if isinstance(items, list) else None
+        if not f:
+            raise GitetError(f"{full} doesn't have a README")
+        text = http_text(self._url(f"/repos/{path}/raw/{urllib.parse.quote(f['path'])}"), self._headers(), label=self.label)
+        return {"name": f["name"], "text": text, "html_url": f"https://{self.host}/{path}"}
+
+    def search(self, q: str, limit: int) -> list:
+        d = self._get("/repos/search", {"q": q, "limit": limit, "sort": "stars", "order": "desc"}, cache=False)
+        return [{"repo": self.canonical(it["full_name"]), "description": it.get("description") or "",
+                 "stars": it.get("stars_count", 0), "language": it.get("language") or "", "url": it.get("html_url"),
+                 "updated": it.get("updated_at")} for it in (d.get("data") or [])]
+
+
+PROVIDER_CLASSES = {"github": GitHub, "gitlab": GitLab, "gitea": Gitea}
+
+
+def provider_for(t: Target) -> Provider:
+    return PROVIDER_CLASSES[t.kind](t.host, t.prefix)
+
+
+def default_provider(name: str) -> Provider:
+    kind, prefix, host = PREFIXES[name]
+    return PROVIDER_CLASSES[kind](host, prefix)
+
+
+def repo_name(full: str) -> str:
+    return full.rsplit("/", 1)[-1]
 
 
 def resolve_repo(arg: str, yes: bool = False) -> dict:
-    parsed = parse_repo(arg)
-    if not parsed:  # bare word -> search GitHub
-        items = api("/search/repositories", {"q": arg, "per_page": 5}, cache=False).get("items", [])
+    t = parse_target(arg)
+    if t is None:  # a search term: "name" (GitHub) or "gitlab:name" / "codeberg:name"
+        m = re.match(r"^(github|gitlab|codeberg):([^/:]+)$", arg.strip(), re.I)
+        pname, term = (m.group(1).lower(), m.group(2)) if m else ("github", arg)
+        items = default_provider(pname).search(term, 5)
         if not items:
-            raise GitetError(f"no GitHub repository found for '{arg}'")
+            raise GitetError(f"no repository found for '{arg}'")
         if len(items) > 1 and not yes:
             if not sys.stdin.isatty():
-                raise GitetError(f"'{arg}' is ambiguous; use owner/repo (try: gitet search {arg})")
+                raise GitetError(f"'{arg}' is ambiguous; use the full name (try: gitet search {arg})")
             for i, it in enumerate(items, 1):
-                print(f"  {i}. {it['full_name']}  ★{it['stargazers_count']}  {(it.get('description') or '')[:60]}",
-                      file=sys.stderr)
+                print(f"  {i}. {it['repo']}  ★{it['stars']}  {it['description'][:60]}", file=sys.stderr)
             pick = input("Pick [1-%d, Enter=1, q=quit]: " % len(items)).strip().lower()
             if pick == "q":
                 raise GitetError("cancelled")
             items = [items[int(pick) - 1]] if pick.isdigit() and 1 <= int(pick) <= len(items) else items[:1]
-        parsed = tuple(items[0]["full_name"].split("/", 1))
-    return api(f"/repos/{parsed[0]}/{parsed[1]}")
+        t = parse_target(items[0]["repo"])
+        if t is None:
+            raise GitetError(f"couldn't understand '{items[0]['repo']}'")
+    return provider_for(t).repo(t.path)
 
 
 def get_release(full: str, tag: str | None = None, pre: bool = False) -> dict:
-    if tag:
-        return api(f"/repos/{full}/releases/tags/{urllib.parse.quote(tag)}")
-    if not pre:
-        try:
-            return api(f"/repos/{full}/releases/latest")
-        except ApiError as e:
-            if e.code != 404:
-                raise
-    for r in api(f"/repos/{full}/releases", {"per_page": 15}):
-        if not r.get("draft"):
-            return r
-    raise GitetError(f"{full} has no releases")
+    t = parse_target(full)
+    if t is None:
+        raise GitetError(f"unrecognised repository '{full}'")
+    return provider_for(t).release(t.path, tag, pre)
 
 
 # --------------------------------------------------------------------------
@@ -662,7 +959,7 @@ def flatpak_integrate(app_id: str, slug: str, full: str) -> dict:
         desktop.write_text("\n".join(lines) + "\n")
     else:
         desktop.write_text("[Desktop Entry]\nType=Application\n"
-                           f"Name={full.split('/')[1]}\nExec=flatpak run {shlex.quote(app_id)}\n"
+                           f"Name={repo_name(full)}\nExec=flatpak run {shlex.quote(app_id)}\n"
                            + (f"Icon={icon}\n" if icon else "") + "Terminal=false\nCategories=Utility;\n")
     link = BIN_DIR / slug
     if (link.exists() or link.is_symlink()) and not _ours(link):
@@ -883,7 +1180,7 @@ def install_appimage(path: Path, full: str, slug: str, prev) -> dict:
     os.chmod(path, 0o755)
     meta = extract_meta(path, slug)
     if meta["Name"] == slug:
-        meta["Name"] = full.split("/")[1]
+        meta["Name"] = repo_name(full)
     shutil.move(str(path), str(target) + ".new")
     os.replace(str(target) + ".new", target)
 
@@ -1045,7 +1342,7 @@ def install_archive(path: Path, full: str, slug: str, prev) -> dict:
     desktops = sorted(app_dir.rglob("*.desktop"))[:1]  # desktop apps usually ship their own launcher entry
     if desktops:
         d = parse_desktop(desktops[0])
-        meta = {"Name": d.get("Name") or full.split("/")[1], "icon": ""}
+        meta = {"Name": d.get("Name") or repo_name(full), "icon": ""}
         for k in ("Comment", "Categories", "MimeType", "StartupWMClass", "Terminal"):
             if d.get(k):
                 meta[k] = d[k]
@@ -1177,7 +1474,7 @@ def do_install(full: str, rel: dict, only: set | None, dry: bool, prev, pattern=
                 dest = wd / re.sub(r"[^\w.+-]", "_", asset["name"])
                 download(asset, dest)
                 verify_arch(kind, dest)
-                extra = INSTALLERS[kind](dest, full, slugify(full.split("/")[1]), prev)
+                extra = INSTALLERS[kind](dest, full, slugify(repo_name(full)), prev)
             except NeedRoot:
                 raise
             except InstallError as e:
@@ -1538,18 +1835,26 @@ def cmd_list(args) -> int:
 
 
 def cmd_search(args) -> int:
-    items = api("/search/repositories", {"q": " ".join(args.query), "per_page": 20}, cache=False).get("items", [])
+    q = " ".join(args.query)
+    names = ["github", "gitlab", "codeberg"] if args.on == "all" else [args.on]
+    items, errors = [], []
+    for n in names:
+        try:
+            for it in default_provider(n).search(q, 20):
+                items.append(dict(it, host=n))
+        except GitetError as e:
+            if len(names) == 1:
+                raise
+            errors.append(f"{n}: {e}")
+            warn(f"{n}: {e}")
     if args.json:
-        jprint({"results": [{"repo": it["full_name"], "description": it.get("description") or "",
-                             "stars": it.get("stargazers_count", 0), "language": it.get("language") or "",
-                             "url": it.get("html_url"), "updated": it.get("pushed_at") or it.get("updated_at")}
-                            for it in items]})
+        jprint({"results": items, "errors": errors})
         return 0
     if not items:
         print("no results", file=sys.stderr)
         return 1
-    for it in items[:10]:
-        print(f"{it['full_name']}  ★{it['stargazers_count']}")
+    for it in items[:30 if len(names) > 1 else 10]:
+        print(f"{it['repo']}  ★{it['stars']}")
         if it.get("description"):
             print(f"    {it['description'][:100]}")
     return 0
@@ -2059,17 +2364,10 @@ def page(text: str, no_pager: bool = False) -> None:
 def cmd_readme(args) -> int:
     meta = resolve_repo(args.repo)
     full = meta["full_name"]
-    try:
-        data = api(f"/repos/{full}/readme")
-    except ApiError as e:
-        if e.code == 404:
-            raise GitetError(f"{full} doesn't have a README")
-        raise
-    try:
-        raw = base64.b64decode(data.get("content", "")).decode("utf-8", errors="replace")
-    except ValueError:
-        raise GitetError("couldn't decode the README")
-    name = data.get("name") or "README"
+    t = parse_target(full)
+    data = provider_for(t).readme(t.path)
+    raw = data["text"]
+    name = data["name"]
     is_md = name.lower().endswith((".md", ".markdown", ".mdown", ".mkd", ".mdx"))
     if args.json:
         width = args.width or 90
@@ -2162,7 +2460,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="gitet", description="Install apps straight from GitHub releases "
         "(Flatpak > DEB/RPM > AppImage).",
         epilog="examples:\n  gitet install dpaulat/SupercellWX\n  gitet install owner/repo --dry-run\n"
-               "  gitet types owner/repo               # what fits my system?\n  gitet readme owner/repo              # read its README\n  gitet install owner/repo --type appimage\n  gitet delete owner/repo\n  gitet update\n  gitet self-update          # update gitet itself\n  gitet auto on --every 12\n  gitet export apps.json   # then on another PC:\n"
+               "  gitet install gitlab:group/project   # other hosts: gitlab: codeberg: gitea:host/owner/repo\n  gitet types owner/repo               # what fits my system?\n  gitet readme owner/repo              # read its README\n  gitet install owner/repo --type appimage\n  gitet delete owner/repo\n  gitet update\n  gitet self-update          # update gitet itself\n  gitet auto on --every 12\n  gitet export apps.json   # then on another PC:\n"
                "  gitet import apps.json",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"gitet {VERSION}")
@@ -2213,8 +2511,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-pager", action="store_true", help="print everything instead of using a pager")
     s.set_defaults(fn=cmd_readme)
 
-    s = sub.add_parser("search", help="search GitHub repositories")
+    s = sub.add_parser("search", help="search GitHub (default), GitLab or Codeberg")
     s.add_argument("query", nargs="+")
+    s.add_argument("--on", choices=["github", "gitlab", "codeberg", "all"], default="github", help="where to search")
     s.set_defaults(fn=cmd_search)
 
     s = sub.add_parser("auto", help="toggle automatic background updates (default: off)")

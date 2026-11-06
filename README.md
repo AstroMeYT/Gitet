@@ -1,6 +1,6 @@
 # Gitet
 
-Install and update Linux apps straight from GitHub releases with one command.
+Install and update Linux apps straight from GitHub releases (or GitLab and Codeberg) with one command.
 
 ```bash
 gitet install dpaulat/SupercellWX
@@ -52,7 +52,7 @@ Flatpaks and AppImages are added to your `PATH` (a command named after the repo)
 ## Usage
 
 ```bash
-gitet install owner/repo          # or a GitHub URL, or just a name to search
+gitet install owner/repo          # GitHub (the default host); or a URL, or just a name to search
 gitet types owner/repo            # what does this repo offer for my system?
 gitet readme owner/repo           # read the repo's README in your terminal
 gitet update                      # update all apps (or: gitet update name)
@@ -83,7 +83,7 @@ gitet install owner/repo --dry-run           # show what would happen
 | `list` (`ls`) | Show installed apps, versions and install type |
 | `types` (`info`, `formats`) | List the package types a repo's release offers for your system |
 | `readme` | Show a repo's README as formatted plain text. `--raw` shows the source, `-w N` sets the wrap width, `--no-pager` prints it all |
-| `search` | Search GitHub repositories |
+| `search` | Search GitHub (default), GitLab or Codeberg: `--on github\|gitlab\|codeberg\|all` |
 | `auto on\|off\|status` | Toggle automatic background updates |
 | `export` / `import` | Save or restore your app list |
 | `self-update` | Update gitet itself (`--check`, `--force`) |
@@ -98,6 +98,22 @@ gitet readme owner/repo
 ```
 
 The Markdown is converted to plain text: headings are underlined, lists use `-`, tables are drawn with `+---+` borders (or turned into `Header: value` lists if they're too wide), quotes get a `|` prefix, links become `text (url)`, and badges become `[label]`. Long READMEs open in your pager (`$PAGER`, or `less`).
+
+## Other hosts
+
+GitHub is the main host and needs no prefix. Other hosts use a `host:` prefix:
+
+```bash
+gitet install dpaulat/SupercellWX               # GitHub
+gitet install gitlab:group/project              # GitLab (nested groups work: gitlab:group/sub/project)
+gitet install codeberg:owner/repo               # Codeberg
+gitet install gitea:git.example.com/owner/repo  # any self-hosted Gitea or Forgejo
+gitet install gitlab:git.example.org/group/project   # self-hosted GitLab
+```
+
+Repo URLs for github.com, gitlab.com and codeberg.org work too. Every command accepts these names (`types`, `readme`, `update`, `delete`, ...), and `gitet list` shows them as you typed them. `gitet search gitlab:term` or `gitet search term --on gitlab` searches that host, and `--on all` searches all three.
+
+Notes: GitLab releases don't report file sizes or checksums, so those show as "size unknown" and aren't verified. For GitLab, release asset links and files uploaded into the release notes are both picked up.
 
 ## JSON output
 
@@ -147,13 +163,13 @@ gitet self-update
 | `~/.local/share/gitet/state.json` | Installed apps and settings |
 | `~/.local/share/gitet/appimages/` | Downloaded AppImages |
 | `~/.local/share/gitet/apps/` | Extracted archives |
-| `~/.config/gitet/token` | Optional GitHub token (also read from `GITHUB_TOKEN` / `GH_TOKEN`) |
+| `~/.config/gitet/token` | Optional GitHub token (also read from `GITHUB_TOKEN` / `GH_TOKEN`). Other hosts: `token-gitlab`, `token-codeberg`, `token-gitea`, or `GITLAB_TOKEN` / `CODEBERG_TOKEN` / `GITEA_TOKEN` |
 | `~/.local/share/applications/` | Launcher entries created by gitet |
 | `~/.cache/gitet/` | API cache and temporary downloads |
 
 ## Notes
 
 - Run gitet as your normal user. It calls `sudo` itself only when a step needs it.
-- Only public repositories are supported. Set `GITHUB_TOKEN` (or `GH_TOKEN`) to avoid GitHub's API rate limit.
+- Only public repositories are supported. Set `GITHUB_TOKEN` (or `GH_TOKEN`; `GITLAB_TOKEN`, `CODEBERG_TOKEN`, `GITEA_TOKEN` for the other hosts) to avoid API rate limits.
 - Gitet installs whatever the repo publishes. Only install software from authors you trust.
 - Set `GITET_NO_SELF_INSTALL=1` to run `gitet.py` without it installing itself.
